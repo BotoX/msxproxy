@@ -11,7 +11,7 @@ function _M.impersonate(upn, jwt)
     end
 
     local sock = ngx.socket.tcp()
-    sock:settimeouts(1000, 5000, 5000)
+    sock:settimeouts(5000, 5000, 5000)
     local ok, err = sock:connect("127.0.0.1", 7777)
 
     if not ok then

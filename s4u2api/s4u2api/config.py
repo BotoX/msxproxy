@@ -10,8 +10,6 @@ OIDC_AUDIENCE = 'https_webmail.uni-graz.at'
 # logic.py
 VALID_SPNS = {
     'http': 'http/email.uni-graz.at@PERS.AD.UNI-GRAZ.AT',
-    'imap': 'imap/email.uni-graz.at@PERS.AD.UNI-GRAZ.AT',
-    'smtp': 'smtp/email.uni-graz.at@PERS.AD.UNI-GRAZ.AT',
 }
 
 VALKEY_SOCK = '/dev/shm/valkey.sock'

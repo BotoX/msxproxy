@@ -189,7 +189,17 @@ def OnGetItemEstimate(xml: str) -> str:
 """
 
 
-def OnSync(xml: str, claims: dict, deviceId: str, deviceType: str, protocol_version: str, ip: str, ua: str) -> str:
+def OnSync(
+    xml: str,
+    subject: str,
+    email: str,
+    name: str,
+    deviceId: str,
+    deviceType: str,
+    protocol_version: str,
+    ip: str,
+    ua: str
+) -> str:
     try:
         sync_key = int(get_from_xml("SyncKey", xml))
     except Exception:
@@ -224,14 +234,9 @@ def OnSync(xml: str, claims: dict, deviceId: str, deviceType: str, protocol_vers
 </Sync>
 """
 
-    c_email = claims["email"]
-    c_username = claims["user"]["SamAccountName"]
-    c_name = claims["name"]
-
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     plain, html = generate_enroll_mail(
-        c_email,
-        c_name,
+        subject, email, name,
         deviceId, deviceType,
         protocol_version, ip, ua
     )
@@ -252,7 +257,7 @@ def OnSync(xml: str, claims: dict, deviceId: str, deviceType: str, protocol_vers
           <ServerId>fakemail</ServerId>
           <ApplicationData>
             <Email:Subject>*** ACTION REQUIRED ***🐰</Email:Subject>
-            <Email:To>{c_email}</Email:To>
+            <Email:To>{email}</Email:To>
             <Email:From>"uniIT Exchange ActiveSync MFA🥚" &lt;noreply@uni-graz.at&gt;</Email:From>
             <Email:DateReceived>{now}</Email:DateReceived>
             <Email:Read>0</Email:Read>

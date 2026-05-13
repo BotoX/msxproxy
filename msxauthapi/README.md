@@ -3,7 +3,7 @@
 ## Dependencies
 
 ```
-apt install python3-fastapi python3-uvicorn python3-jwt
+apt install python3-fastapi python3-uvicorn python3-jwt python3-httpx
 
 apt install python3-pip python3-dev
 pip install git+https://github.com/BotoX/python-wbxml.git --break-system-packages

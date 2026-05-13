@@ -1,8 +1,8 @@
 import time
 import secrets
 
-from jose import jwt
-from jose.exceptions import JWTError
+import jwt
+from jwt.exceptions import PyJWTError
 from urllib.parse import urlencode
 
 from .auth import oidc
@@ -35,19 +35,6 @@ def generate_enroll_token(
     return jwt.encode(payload, ENROLL_JWT_SECRET, algorithm=ENROLL_JWT_ALG)
 
 
-def verify_enroll_token(token: str) -> dict[str, any]:
-    try:
-        claims = jwt.decode(
-            token,
-            ENROLL_JWT_SECRET,
-            algorithms=[ENROLL_JWT_ALG],
-            issuer=ENROLL_JWT_ISSUER
-        )
-        return claims
-    except JWTError as e:
-        raise ValueError(f"Invalid enroll token: {e}")
-
-
 def keycloak_enroll_link(
     subject: str,
     deviceId: str,
@@ -75,9 +62,18 @@ def keycloak_enroll_link(
     return f"{auth_url}?{urlencode(query)}"
 
 
-def generate_enroll_mail(username, name, deviceId, deviceType, protocol_version, ip, ua):
+def generate_enroll_mail(
+    subject: str,
+    email: str,
+    name: str,
+    deviceId: str,
+    deviceType: str,
+    protocol_version: str,
+    ip: str,
+    ua: str
+) -> (str, str):
     mfa_link = keycloak_enroll_link(
-        username,
+        subject,
         deviceId,
         deviceType,
         3600

@@ -145,9 +145,9 @@ async def ActiveSync_API(
     jwt, claims = await authenticate_or_die(
         credentials.username,
         credentials.password,
-        "openid",
+        "openid profile email",
         DeviceId=deviceId,
-        DeviceType=deviceType,
+        DeviceType=deviceType
     )
 
     acr = claims.get("acr") or ""
@@ -186,7 +186,15 @@ async def ActiveSync_API(
     elif cmd == "getitemestimate":
         res = OnGetItemEstimate(xml)
     elif cmd == "sync":
-        res = OnSync(xml, claims, deviceId, deviceType, protocol_version, ip, ua)
+        subject = claims["preferred_username"]
+        email = claims["email"]
+        name = claims["name"]
+        res = OnSync(
+            xml,
+            subject, email, name,
+            deviceId, deviceType,
+            protocol_version, ip, ua
+        )
     elif cmd == "moveitems":
         res = OnMoveItems()
     else:
@@ -219,7 +227,9 @@ async def catch_all_handler(
     )
 
     jwt, claims = await authenticate_or_die(
-        credentials.username, credentials.password, "openid"
+        credentials.username,
+        credentials.password,
+        "openid"
     )
 
     acr = claims.get("acr")
