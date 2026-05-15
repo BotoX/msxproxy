@@ -41,7 +41,7 @@ class KeycloakOIDCClient:
         audience: str,
         client_id: str,
         client_secret: str | None = None,
-        timeout: float = 3.0
+        timeout: float = 5.0
     ) -> None:
         self.well_known_url = well_known_url
         self.audience = audience

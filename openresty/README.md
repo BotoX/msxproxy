@@ -4,6 +4,8 @@ For Microsoft Exchange Proxy
 `load_module /usr/local/openresty/modules/ngx_http_upstream_ntlm_module.so;`
 
 ```
+    proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
     # lua-resty-upstream-healthcheck
     lua_shared_dict healthcheck 1m;
     lua_socket_log_errors off;

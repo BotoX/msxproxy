@@ -10,6 +10,7 @@ import uvloop
 from . import config
 from .imap_proxy import ImapProxyServer
 from .smtp_proxy import SmtpProxyServer
+from .loadbalancer import LoadBalancer
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +28,20 @@ def _make_tcp_socket(host: str, port: int) -> socket.socket:
 
 
 async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> None:
+    loop = asyncio.get_running_loop()
     imap_sock, imaps_sock, smtp_sock, smtps_sock = socks
 
-    imap_proxy = ImapProxyServer(ssl_ctx)
-    smtp_proxy = SmtpProxyServer(ssl_ctx)
+    imap_lb = await LoadBalancer.create("IMAP-LB", config.IMAP_BACKENDS)
+    smtp_lb = await LoadBalancer.create("SMTP-LB", config.SMTP_BACKENDS)
+
+    imap_proxy = ImapProxyServer(imap_lb, ssl_ctx)
+    smtp_proxy = SmtpProxyServer(smtp_lb, ssl_ctx)
 
     imap_srv  = await asyncio.start_server(imap_proxy.handle_client, sock=imap_sock)
     imaps_srv = await asyncio.start_server(imap_proxy.handle_client, sock=imaps_sock, ssl=ssl_ctx)
     smtp_srv  = await asyncio.start_server(smtp_proxy.handle_client, sock=smtp_sock)
     smtps_srv = await asyncio.start_server(smtp_proxy.handle_client, sock=smtps_sock, ssl=ssl_ctx)
 
-    loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
     def _request_stop() -> None:
@@ -51,6 +55,9 @@ async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> N
     # Stop accepting new connections as soon as the stop event fires.
     async with imap_srv, imaps_srv, smtp_srv, smtps_srv:
         await stop_event.wait()
+
+    # Stop load balancers
+    await asyncio.gather(imap_lb.cancel(), smtp_lb.cancel(), return_exceptions=True)
 
     # Cancel and drain every in-flight connection task.
     current = asyncio.current_task()

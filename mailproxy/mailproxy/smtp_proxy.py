@@ -9,13 +9,15 @@ from .auth import OIDCError, TrustedNetworkError
 from .utils import AUTH_MECHS, sasl_auth_flow, close_writer
 from .smtp_backend import smtp_ensure_tls_and_ehlo, smtp_gssapi_auth, smtp_login_auth
 from .relay import relay
+from .loadbalancer import LoadBalancer
 
 logger = logging.getLogger(__name__)
 
 
 class SmtpProxyServer:
-    def __init__(self, ssl_context: ssl.SSLContext | None = None) -> None:
-        self._ssl_context = ssl_context
+    def __init__(self, lb: LoadBalancer, ssl_ctx: ssl.SSLContext | None = None) -> None:
+        self.lb = lb
+        self._ssl_ctx = ssl_ctx
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         addr = writer.get_extra_info("peername")
@@ -24,8 +26,8 @@ class SmtpProxyServer:
         logger.debug(f"SMTP client connected: {addr}, TLS={is_tls}")
 
         tries = 0
-        backend_reader = None
-        backend_writer = None
+        be_reader = None
+        be_writer = None
         try:
             async with asyncio.timeout(config.AUTH_TIMEOUT):
                 # Initial greeting
@@ -33,7 +35,7 @@ class SmtpProxyServer:
                 writer.write(greeting.encode())
                 await writer.drain()
 
-                while not backend_writer:
+                while not be_writer:
                     try:
                         line = await reader.readline()
                         if not line:
@@ -59,7 +61,7 @@ class SmtpProxyServer:
                         caps = [f"{config.PROXY_HOSTNAME} Hello [{addr[0]}]"]
                         if cmd == "EHLO":
                             # STARTTLS only if not already TLS and ssl_context available
-                            if (not is_tls) and (self._ssl_context is not None):
+                            if (not is_tls) and (self._ssl_ctx is not None):
                                 caps.insert(1, "STARTTLS")
                             else:
                                 caps.append("AUTH " + " ".join(AUTH_MECHS))
@@ -76,7 +78,7 @@ class SmtpProxyServer:
                             await writer.drain()
                             continue
 
-                        if self._ssl_context is None:
+                        if self._ssl_ctx is None:
                             writer.write(b"454 4.7.0 TLS not available\r\n")
                             await writer.drain()
                             continue
@@ -84,7 +86,7 @@ class SmtpProxyServer:
                         writer.write(b"220 2.0.0 Ready to start TLS\r\n")
                         await writer.drain()
 
-                        await writer.start_tls(self._ssl_context)
+                        await writer.start_tls(self._ssl_ctx)
                         is_tls = True  # from now on, this connection is encrypted
 
                     elif cmd == "AUTH":
@@ -94,8 +96,8 @@ class SmtpProxyServer:
                             await writer.drain()
                             continue
 
-                        backend_reader, backend_writer = await self._handle_auth(parts, reader, writer, addr)
-                        if not backend_writer:
+                        be_reader, be_writer = await self._handle_auth(parts, reader, writer, addr)
+                        if not be_writer:
                             tries += 1
                             await asyncio.sleep(tries)
 
@@ -124,9 +126,9 @@ class SmtpProxyServer:
                         writer.write(b"502 5.5.2 Command not recognized\r\n")
                         await writer.drain()
 
-            if backend_reader and backend_writer:
+            if be_reader and be_writer:
                 # Start relaying traffic
-                await relay(reader, writer, backend_reader, backend_writer)
+                await relay(reader, writer, be_reader, be_writer)
 
         except TimeoutError:
             logger.debug(f"SMTP client {addr} timed out after {config.AUTH_TIMEOUT}s")
@@ -138,8 +140,8 @@ class SmtpProxyServer:
             pass
 
         finally:
-            if backend_writer:
-                await close_writer(backend_writer)
+            if be_writer:
+                await close_writer(be_writer)
             await close_writer(writer)
             logger.debug(f"SMTP client disconnected: {addr}")
 
@@ -193,46 +195,41 @@ class SmtpProxyServer:
         logger.info(f"SMTP ({mech}) authenticated {upn} (u={username}) (authzid={authzid})")
 
         # --------------- BACKEND CONNECTION ---------------
-        backend = (config.EXCHANGE_SMTP_HOST, config.EXCHANGE_SMTP_PORT, False)
-        backend_ssl_ctx = ssl.create_default_context()
-        backend_username = None
-        backend_password = None
+        be_reader, be_writer, be_host, be_ssl_ctx = None, None, None, None
+        be_username = None
+        be_password = None
+
         try:
-            # STARTTLS
-            backend_reader, backend_writer = await asyncio.open_connection(
-                host=backend[0],
-                port=backend[1],
-                ssl=backend_ssl_ctx if backend[2] else None
-            )
-        except Exception as e:
-            logger.error(f"SMTP backend connect failed: {e}")
-            writer.write(b"454 4.7.0 Backend unavailable\r\n")
+            be_reader, be_writer, be_host, be_ssl_ctx = await self.lb.connect()
+        except ConnectionError as e:
+            logger.error(str(e))
+            writer.write(b"454 4.7.0 Service unavailable; all backends down\r\n")
             await writer.drain()
             return None, None
 
         try:
             caps = await smtp_ensure_tls_and_ehlo(
-                reader=backend_reader,
-                writer=backend_writer,
-                hostname=backend[0],
-                ssl_context=backend_ssl_ctx,
+                reader=be_reader,
+                writer=be_writer,
+                hostname=be_host,
+                ssl_context=be_ssl_ctx,
                 ehlo_name=config.EHLO
             )
             logger.debug("Backend SMTP capabilities after TLS: %r", caps)
 
-            if False and backend_username and backend_password:
+            if False and be_username and be_password:
                 ok, last_line = await smtp_login_auth(
-                    backend_reader,
-                    backend_writer,
-                    backend_username,
-                    backend_password
+                    be_reader,
+                    be_writer,
+                    be_username,
+                    be_password
                 )
                 if not ok:
                     raise RuntimeError(f"SMTP LOGIN auth failed on backend: {last_line}")
             else:
                 ok, last_line = await smtp_gssapi_auth(
-                    reader=backend_reader,
-                    writer=backend_writer,
+                    reader=be_reader,
+                    writer=be_writer,
                     upn=upn,
                     jwt=jwt,
                     spn="smtp"
@@ -243,7 +240,7 @@ class SmtpProxyServer:
         except Exception as e:
             traceback.print_exc()
             logger.error(f"Backend SMTP auth failed for {upn}: {e}")
-            await close_writer(backend_writer)
+            await close_writer(be_writer)
             writer.write(b"454 4.7.0 Backend authentication failed\r\n")
             await writer.drain()
             return None, None
@@ -252,4 +249,4 @@ class SmtpProxyServer:
         writer.write(b"235 2.7.0 Authentication successful\r\n")
         await writer.drain()
 
-        return backend_reader, backend_writer
+        return be_reader, be_writer

@@ -8,15 +8,17 @@ S4U2API_HOST = "127.0.0.1"
 S4U2API_PORT = "7777"
 
 # ---------------------------------------------------------
-# Exchange hosts / ports / SPNs
+# Exchange hosts / ports / caps
 # ---------------------------------------------------------
 
 # IMAP
-EXCHANGE_IMAP_HOST = "ex19ms04.pers.ad.uni-graz.at"
-EXCHANGE_IMAP_PORT = 143         # STARTTLS capable IMAP (plain port)
-EXCHANGE_IMAPS_HOST = "ex19ms04.pers.ad.uni-graz.at"
-EXCHANGE_IMAPS_PORT = 993        # implicit TLS IMAP
-EXCHANGE_IMAP_SPN = "imap/email.uni-graz.at@PERS.AD.UNI-GRAZ.AT"
+IMAP_BACKENDS = [ # host, port, is_tls
+    ("ex19ms01.uni-graz.at", 993, True),
+    ("ex19ms02.uni-graz.at", 993, True),
+    ("ex19ms03.uni-graz.at", 993, True),
+    ("ex19ms04.uni-graz.at", 993, True)
+]
+
 IMAP_CAPS = [
     "IMAP4",
     "IMAP4rev1",
@@ -31,11 +33,13 @@ IMAP_CAPS = [
 ]
 
 # SMTP
-EXCHANGE_SMTP_HOST = "ex19ms04.pers.ad.uni-graz.at"
-EXCHANGE_SMTP_PORT = 587         # STARTTLS capable SMTP (plain port)
-EXCHANGE_SMTPS_HOST = "ex19ms04.pers.ad.uni-graz.at"
-EXCHANGE_SMTPS_PORT = 465        # implicit TLS SMTP
-EXCHANGE_SMTP_SPN = "smtp/email.uni-graz.at@PERS.AD.UNI-GRAZ.AT"
+SMTP_BACKENDS = [ # host, port, is_tls
+    ("ex19ms01.uni-graz.at", 587, False),
+    ("ex19ms02.uni-graz.at", 587, False),
+    ("ex19ms03.uni-graz.at", 587, False),
+    ("ex19ms04.uni-graz.at", 587, False)
+]
+
 ESMTP_CAPS = [
     "SIZE 104857600",
     "PIPELINING",
@@ -99,3 +103,12 @@ AUTH_TIMEOUT = 60
 
 PROXY_CERT_FILE = "mailproxy.pem"
 PROXY_KEY_FILE = "mailproxy.key"
+
+# ---------------------------------------------------------
+# Load Balancer
+# ---------------------------------------------------------
+
+LB_CHECK_INTERVAL = 2.0   # 'inter': Seconds between active health checks
+LB_FALL = 3               # 'fall': Consecutive failures to mark DOWN
+LB_RISE = 2               # 'rise': Consecutive successes to mark UP
+LB_TIMEOUT = 1.0          # Health check connection timeout

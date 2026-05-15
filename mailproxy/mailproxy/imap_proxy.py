@@ -14,13 +14,15 @@ from .imap_backend import (
     imap_ensure_tls
 )
 from .relay import relay
+from .loadbalancer import LoadBalancer
 
 logger = logging.getLogger(__name__)
 
 
 class ImapProxyServer:
-    def __init__(self, ssl_context: ssl.SSLContext | None = None) -> None:
-        self._ssl_context = ssl_context
+    def __init__(self, lb: LoadBalancer, ssl_ctx: ssl.SSLContext | None = None) -> None:
+        self.lb = lb
+        self._ssl_ctx = ssl_ctx
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         addr = writer.get_extra_info("peername")
@@ -31,8 +33,8 @@ class ImapProxyServer:
         logger.debug(f"IMAP client connected: {addr}, TLS={is_tls}")
 
         tries = 0
-        backend_reader = None
-        backend_writer = None
+        be_reader = None
+        be_writer = None
         try:
             async with asyncio.timeout(config.AUTH_TIMEOUT):
                 # Initial greeting
@@ -40,7 +42,7 @@ class ImapProxyServer:
                 writer.write(greeting.encode())
                 await writer.drain()
 
-                while not backend_writer:
+                while not be_writer:
                     try:
                         cmd = await parser.read_command()
                     except ValueError as e:
@@ -63,7 +65,7 @@ class ImapProxyServer:
                     if command == "CAPABILITY":
                         caps = config.IMAP_CAPS[:]
 
-                        if (not is_tls) and (self._ssl_context is not None):
+                        if (not is_tls) and (self._ssl_ctx is not None):
                             # Cleartext connection, STARTTLS available
                             caps.insert(0, "STARTTLS")
                             # Don’t allow cleartext LOGIN/PLAIN
@@ -85,7 +87,7 @@ class ImapProxyServer:
                             await writer.drain()
                             continue
 
-                        if self._ssl_context is None:
+                        if self._ssl_ctx is None:
                             writer.write(f"{tag} BAD TLS not available\r\n".encode())
                             await writer.drain()
                             continue
@@ -95,7 +97,7 @@ class ImapProxyServer:
                         await writer.drain()
 
                         # Upgrade to TLS
-                        await writer.start_tls(self._ssl_context)
+                        await writer.start_tls(self._ssl_ctx)
                         is_tls = True
                         logger.info(f"IMAP client {addr} upgraded to TLS via STARTTLS")
 
@@ -109,8 +111,8 @@ class ImapProxyServer:
                             await writer.drain()
                             continue
 
-                        backend_reader, backend_writer = await self._handle_auth(cmd, reader, writer, addr)
-                        if not backend_writer:
+                        be_reader, be_writer = await self._handle_auth(cmd, reader, writer, addr)
+                        if not be_writer:
                             tries += 1
                             await asyncio.sleep(tries)
 
@@ -125,9 +127,9 @@ class ImapProxyServer:
                         writer.write(f"{tag} BAD Authentication required\r\n".encode("utf-8"))
                         await writer.drain()
 
-            if backend_reader and backend_writer:
+            if be_reader and be_writer:
                 # Start relaying traffic
-                await relay(reader, writer, backend_reader, backend_writer)
+                await relay(reader, writer, be_reader, be_writer)
 
         except TimeoutError:
             logger.debug(f"IMAP client {addr} timed out after {config.AUTH_TIMEOUT}s")
@@ -139,8 +141,8 @@ class ImapProxyServer:
             pass
 
         finally:
-            if backend_writer:
-                await close_writer(backend_writer)
+            if be_writer:
+                await close_writer(be_writer)
             await close_writer(writer)
             logger.debug(f"IMAP client disconnected: {addr}")
 
@@ -214,44 +216,38 @@ class ImapProxyServer:
         logger.info(f"IMAP ({mech}) authenticated {upn} (u={username}) (authzid={authzid})")
 
         # --------------- BACKEND CONNECTION ---------------
-        backend = (config.EXCHANGE_IMAPS_HOST, config.EXCHANGE_IMAPS_PORT, True)
-        backend_ssl_ctx = ssl.create_default_context()
-        backend_username = None
-        backend_password = None
+        be_reader, be_writer, be_host, be_ssl_ctx = None, None, None, None
+        be_username = None
+        be_password = None
 
         try:
-            # Implicit TLS
-            backend_reader, backend_writer = await asyncio.open_connection(
-                host=backend[0],
-                port=backend[1],
-                ssl=backend_ssl_ctx if backend[2] else None
-            )
-        except Exception as e:
-            logger.error("IMAP backend connect failed: %s", e)
-            writer.write(f"{tag} NO [UNAVAILABLE] Backend unavailable\r\n".encode())
+            be_reader, be_writer, be_host, be_ssl_ctx = await self.lb.connect()
+        except ConnectionError as e:
+            logger.error(str(e))
+            writer.write(f"{tag} NO [UNAVAILABLE] All backends unavailable\r\n".encode())
             await writer.drain()
             return None, None
 
         try:
             tag_counter = await imap_ensure_tls(
-                reader=backend_reader,
-                writer=backend_writer,
-                hostname=backend[0],
-                ssl_context=backend_ssl_ctx
+                reader=be_reader,
+                writer=be_writer,
+                hostname=be_host,
+                ssl_context=be_ssl_ctx
             )
 
-            if False and backend_username and backend_password:
+            if False and be_username and be_password:
                 await imap_plain_auth(
-                    backend_reader,
-                    backend_writer,
-                    backend_username,
-                    backend_password,
+                    be_reader,
+                    be_writer,
+                    be_username,
+                    be_password,
                     tag_counter=tag_counter
                 )
             else:
                 await imap_gssapi_auth(
-                    reader=backend_reader,
-                    writer=backend_writer,
+                    reader=be_reader,
+                    writer=be_writer,
                     upn=upn,
                     jwt=jwt,
                     spn="imap",
@@ -260,7 +256,7 @@ class ImapProxyServer:
         except Exception as e:
             traceback.print_exc()
             logger.error(f"IMAP backend auth failed for {upn}: {e}")
-            await close_writer(backend_writer)
+            await close_writer(be_writer)
             writer.write(f"{tag} NO [UNAVAILABLE] Backend authentication failed\r\n".encode())
             await writer.drain()
             return None, None
@@ -269,4 +265,4 @@ class ImapProxyServer:
         writer.write(f"{tag} OK {cmd.command} completed\r\n".encode())
         await writer.drain()
 
-        return backend_reader, backend_writer
+        return be_reader, be_writer
