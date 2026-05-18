@@ -83,10 +83,10 @@ def _abort(status_code: int, msg: str, ttl: int):
     )
 
 async def authenticate_or_die(
-    username: str, password: str, scope: str = "openid", **kwargs
+    username: str, password: str, user_ip: str, scope: str = "openid", **kwargs
 ) -> dict[str, any]:
     try:
-        json, claims = await auth.password(username, password, scope, **kwargs)
+        json, claims = await auth.password(username, password, user_ip, scope, **kwargs)
         access_token = json["access_token"]
     except auth.UnauthorizedError as e:
         _abort(
@@ -145,6 +145,7 @@ async def ActiveSync_API(
     jwt, claims = await authenticate_or_die(
         credentials.username,
         credentials.password,
+        ip,
         "openid profile email",
         DeviceId=deviceId,
         DeviceType=deviceType
@@ -222,6 +223,7 @@ async def catch_all_handler(
     path_name: str,
     credentials: Annotated[HTTPBasicCredentials, Depends(basic_header)],
 ):
+    ip = request.client.host
     is_trustedNetwork = (
         request.headers.get("X-Trusted-Network", "false").lower() == "true"
     )
@@ -229,6 +231,7 @@ async def catch_all_handler(
     jwt, claims = await authenticate_or_die(
         credentials.username,
         credentials.password,
+        ip,
         "openid"
     )
 

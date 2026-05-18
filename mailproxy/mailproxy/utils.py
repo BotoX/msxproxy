@@ -245,7 +245,7 @@ async def sasl_auth_flow(
 
     # Password-based verification (PLAIN / LOGIN)
     if username and password:
-        json, claims = await auth.password(username, password)
+        json, claims = await auth.password(username, password, ip_address)
         jwt = json["id_token"]
 
     if claims:
@@ -264,7 +264,7 @@ async def imap_login(
     if not password:
         raise ValueError("invalid LOGIN payload: missing password")
 
-    json, claims = await auth.password(username, password)
+    json, claims = await auth.password(username, password, ip_address)
     jwt = json["id_token"]
 
     upn = auth.claims2principal(claims, ip_address)

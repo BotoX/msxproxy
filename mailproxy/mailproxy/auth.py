@@ -109,6 +109,7 @@ class KeycloakOIDCClient:
         self,
         username: str,
         password: str,
+        user_ip: str,
         scope: str = "openid",
         **kwargs
     ) -> dict[str, any]:
@@ -123,8 +124,12 @@ class KeycloakOIDCClient:
         if self.client_secret is not None:
             data["client_secret"] = self.client_secret
 
+        headers = {
+            "X-Forwarded-For": user_ip
+        }
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.token_endpoint, data=data)
+            resp = await client.post(self.token_endpoint, data=data, headers=headers)
             resp.raise_for_status()
             return resp.json()
 
@@ -152,11 +157,12 @@ def claims2principal(claims: dict[str, any], ip_address: str) -> str:
 async def password(
     username: str,
     password: str,
+    user_ip: str,
     scope: str = "openid",
     **kwargs
 ) -> dict[str, any]:
     try:
-        json = await oidc.password_grant(username, password, scope, **kwargs)
+        json = await oidc.password_grant(username, password, user_ip, scope, **kwargs)
 
     except httpx.HTTPStatusError as e:
         status_code = e.response.status_code
@@ -175,7 +181,7 @@ async def password(
 
     except httpx.HTTPError as e:
         logger.error("Keycloak connection failed for user '%s': %s", username, e)
-        raise # OIDCError("Authentication service temporarily unavailable")
+        raise OIDCError("Authentication service temporarily unavailable")
 
     id_token = json.get("id_token")
     if not id_token:

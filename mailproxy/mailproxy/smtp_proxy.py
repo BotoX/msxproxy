@@ -86,7 +86,11 @@ class SmtpProxyServer:
                         writer.write(b"220 2.0.0 Ready to start TLS\r\n")
                         await writer.drain()
 
-                        await writer.start_tls(self._ssl_ctx)
+                        try:
+                            await writer.start_tls(self._ssl_ctx)
+                        except Exception as e:
+                            logger.warning("SMTP start_tls error from '%s': %s", addr[0], e)
+                            return
                         is_tls = True  # from now on, this connection is encrypted
 
                     elif cmd == "AUTH":

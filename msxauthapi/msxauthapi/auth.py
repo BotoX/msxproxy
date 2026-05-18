@@ -103,6 +103,7 @@ class KeycloakOIDCClient:
         self,
         username: str,
         password: str,
+        user_ip: str,
         scope: str = "openid",
         **kwargs
     ) -> dict[str, any]:
@@ -117,8 +118,12 @@ class KeycloakOIDCClient:
         if self.client_secret is not None:
             data["client_secret"] = self.client_secret
 
+        headers = {
+            "X-Forwarded-For": user_ip
+        }
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.token_endpoint, data=data)
+            resp = await client.post(self.token_endpoint, data=data, headers=headers)
             resp.raise_for_status()
             return resp.json()
 
@@ -133,11 +138,12 @@ def claims2principal(claims: dict[str, any]) -> str:
 async def password(
     username: str,
     password: str,
+    user_ip: str,
     scope: str = "openid",
     **kwargs
 ) -> dict[str, any]:
     try:
-        json = await oidc.password_grant(username, password, scope, **kwargs)
+        json = await oidc.password_grant(username, password, user_ip, scope, **kwargs)
 
     except httpx.HTTPStatusError as e:
         status_code = e.response.status_code
@@ -166,7 +172,7 @@ async def password(
     try:
         claims = oidc.verify(access_token)
     except (ValueError, PyJWTError) as e:
-        logger.warning("Token verification failed for '%s': %s", username, e)
+        logger.warning("Keycloak token verification failed for '%s': %s", username, e)
         raise UnauthorizedError("Invalid or expired token")
 
     return json, claims

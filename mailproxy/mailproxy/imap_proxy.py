@@ -96,10 +96,12 @@ class ImapProxyServer:
                         writer.write(f"{tag} OK Begin TLS negotiation now\r\n".encode())
                         await writer.drain()
 
-                        # Upgrade to TLS
-                        await writer.start_tls(self._ssl_ctx)
+                        try:
+                            await writer.start_tls(self._ssl_ctx)
+                        except Exception as e:
+                            logger.warning("IMAP start_tls error from '%s': %s", addr[0], e)
+                            return
                         is_tls = True
-                        logger.info(f"IMAP client {addr} upgraded to TLS via STARTTLS")
 
                         # After start_tls, the transport/protocol changed; rebuild parser.
                         parser = ImapParser(reader, writer)
