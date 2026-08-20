@@ -1,3 +1,4 @@
+import json
 import logging
 import httpx
 import jwt
@@ -125,7 +126,26 @@ class KeycloakOIDCClient:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(self.token_endpoint, data=data, headers=headers)
             resp.raise_for_status()
-            return resp.json()
+
+            # Check if CrowdSec served an HTML CAPTCHA / Challenge page
+            content_type = resp.headers.get("content-type", "")
+            if "text/html" in content_type and "<title>CrowdSec Captcha</title>" in resp.text:
+                logger.warning(
+                    "CrowdSec CAPTCHA triggered for client IP '%s' (user '%s')",
+                    user_ip,
+                    username
+                )
+                raise ForbiddenError("Authentication blocked by security policy (CrowdSec CAPTCHA)")
+
+            try:
+                return resp.json()
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(
+                    "Keycloak returned non-JSON response (status %s): %s",
+                    resp.status_code,
+                    resp.text[:500]  # Log up to 500 chars of body
+                )
+                raise OIDCError("Keycloak returned an invalid or empty response")
 
 
 def claims2principal(claims: dict[str, any]) -> str:
@@ -147,17 +167,50 @@ async def password(
 
     except httpx.HTTPStatusError as e:
         status_code = e.response.status_code
-        if status_code == 401:
-            logger.info("Keycloak: Invalid credentials for user '%s'", username)
+
+        try:
+            err_data = e.response.json()
+            error_code = err_data.get("error", "unknown_error")
+            error_desc = err_data.get("error_description", e.response.text)
+        except Exception:
+            error_code = "raw_error"
+            error_desc = e.response.text[:200]
+
+        # Check if CrowdSec served a HTML Ban page
+        content_type = e.response.headers.get("content-type", "")
+        if "text/html" in content_type and "<title>CrowdSec Ban</title>" in e.response.text:
+            logger.warning(
+                "CrowdSec BAN triggered for client IP '%s' (user '%s')",
+                user_ip,
+                username
+            )
+            raise ForbiddenError("Authentication blocked by security policy (CrowdSec BAN)")
+
+        # OAuth 2.0 RFC 6749: Keycloak returns 400 with "invalid_grant" on wrong password/username
+        if error_code == "invalid_grant" or status_code == 401:
+            logger.info(
+                "Keycloak invalid credentials for user '%s': %s - %s",
+                username, error_code, error_desc
+            )
             raise UnauthorizedError("Invalid username or password")
+
         elif status_code == 400:
-            logger.warning("Keycloak: Bad request: %s", e)
-            raise BadRequestError("Invalid authentication request")
+            logger.warning(
+                "Keycloak 400 for user '%s': %s - %s",
+                username, error_code, error_desc
+            )
+            raise BadRequestError(f"Invalid authentication request: {error_desc}")
         elif status_code == 403:
-            logger.warning("Keycloak: Access forbidden for user '%s'", username)
+            logger.warning(
+                "Keycloak 403 for user '%s': %s - %s",
+                username, error_code, error_desc
+            )
             raise ForbiddenError("User access is disabled in Keycloak")
         else:
-            logger.error("Keycloak returned unexpected status %s: %s", status_code, e.response.text)
+            logger.error(
+                "Keycloak returned status %s for user '%s': %s - %s",
+                status_code, username, error_code, error_desc
+            )
             raise OIDCError(f"Provider error: {status_code}")
 
     except httpx.HTTPError as e:

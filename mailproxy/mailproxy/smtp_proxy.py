@@ -178,7 +178,7 @@ class SmtpProxyServer:
                 writer=writer,
                 ip_address=addr[0]
             )
-        except EOFError:  # Connection closed
+        except (EOFError, ConnectionResetError):  # Connection closed
             return None, None
         except TrustedNetworkError:
             writer.write(b"535 5.7.8 External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n")

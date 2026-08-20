@@ -107,8 +107,7 @@ PROXY_KEY_FILE = "mailproxy.key"
 # ---------------------------------------------------------
 # Load Balancer
 # ---------------------------------------------------------
-
-LB_CHECK_INTERVAL = 2.0   # 'inter': Seconds between active health checks
+LB_CHECK_INTERVAL = 10.0  # 'inter': Seconds between active health checks
 LB_FALL = 3               # 'fall': Consecutive failures to mark DOWN
 LB_RISE = 2               # 'rise': Consecutive successes to mark UP
-LB_TIMEOUT = 1.0          # Health check connection timeout
+LB_TIMEOUT = 3.0          # Health check connection timeout

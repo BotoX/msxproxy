@@ -196,7 +196,7 @@ class ImapProxyServer:
                 )
                 mech = f"SASL {mech}"
 
-        except EOFError:  # Connection closed
+        except (EOFError, ConnectionResetError):  # Connection closed
             return None, None
         except TrustedNetworkError:
             writer.write(b"* OK [ALERT] External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n")

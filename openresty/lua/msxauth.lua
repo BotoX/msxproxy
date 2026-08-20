@@ -10,6 +10,7 @@ local resty_string  = require("resty.string")
 local resty_http    = require("resty.http")
 local resty_jwt     = require("resty.jwt")
 local resty_openidc = require("resty.openidc")
+local resty_lock    = require("resty.lock")
 local cjson         = require("cjson")
 local bit           = require("bit")
 local ratelimit     = require("ratelimit")
@@ -44,10 +45,11 @@ local is_AutoDiscover = ((ngx.var.is_AutoDiscover or "") ~= "")
 local is_AutoDiscoverXML = ((ngx.var.is_AutoDiscover or "") == "xml")
 local is_AutoDiscoverJSON = ((ngx.var.is_AutoDiscover or "") == "json")
 local is_AutoDiscoverSVC = ((ngx.var.is_AutoDiscover or "") == "svc")
-local modify_AutoDiscover = ((ngx.var.modify_AutoDiscover or "") ~= "")
 
 -- Is the client talking to the ActiveSync endpoint?
 local is_ActiveSync = ((ngx.var.is_ActiveSync or "") == "1")
+
+local is_RPC = ((ngx.var.is_RPC or "") == "1")
 
 -- Is the client connection NTLM pinned? (already authorized on TCP level)
 local is_pinned = ((ngx.var.ntlm_pinned or "") ~= "")
@@ -67,8 +69,15 @@ local CHALLENGES = {
     ntlm = 'NTLM'
 }
 
+local function string_startswith(str, start)
+   return string_sub(str, 1, #start) == start
+end
+
 local function abort(status, auth, msg, failed)
     ngx.status = status
+
+    ngx.log(ngx.ERR, "abort(" .. (status or "") .. "," .. (auth or "") .. "," .. (msg or "") .. ")")
+
     if failed then
         local banned, retry_after = ratelimit.on_failure(ngx.var.remote_addr)
         if banned then
@@ -128,19 +137,23 @@ end
 --
 
 -- Skype for Business
-local ua_Skype = string_find(ua, "Skype for Business", 1, true)
+local ua_Skype = string_find(ua, "Skype for Business", 1, true) or string_startswith(ua, "Yealink")
 if ua_Skype and is_trustedNetwork then
     return
 end
 
--- TODO: Remove before prod
--- Autodiscover passthrough for uni network not in testips
-if is_AutoDiscover and is_trustedNetwork and not is_testIP then
+if is_AutoDiscoverSVC and is_trustedNetwork then
     return
 end
 
-if modify_AutoDiscover then
+-- Microsoft Office/Outlook
+local ua_Microsoft = string_startswith(ua, "Microsoft ") or string_startswith(ua, "ExchangeServicesClient") or ua == "MSRPC"
+local ua_MacOutlook = string_startswith(ua, "MacOutlook")
+
+local ModernAuth = not (is_RPC or ua_Microsoft or ua_MacOutlook or ua_Skype)
+if ModernAuth then
     ngx.header["X-OAuth-Enabled"] = "True"
+    ngx.var.ModernAuth = "1"
 end
 
 if is_AutoDiscoverXML then
@@ -172,7 +185,7 @@ if is_AutoDiscoverJSON then
 
     local proto_key = string_lower(raw_proto)
     local templates
-    if modify_AutoDiscover then
+    if ModernAuth or is_testIP then
         templates = {
             default = [[{"Protocol":"%s","Url":"https://webmail.uni-graz.at/api"}]],
             ews = [[{"Protocol":"%s","Url":"https://webmail.uni-graz.at/EWS/Exchange.asmx"}]],
@@ -207,26 +220,22 @@ if is_pinned then
     return
 end
 
-if (auth_method or "") == "" then
-    return abort(401, bor(AUTH_NTLM, AUTH_BASIC), "Unauthorized: No credentials")
-end
-
 -- Basic Auth = Mail Password
 local auth_flags = AUTH_BASIC
 
 -- NTLM/Negotiate within trusted networks
-if is_trustedNetwork then
+if is_trustedNetwork and not ModernAuth then
     auth_flags = bor(auth_flags, AUTH_NTLM)
 end
 
 -- Bearer if client requests it
-if auth_method == "bearer" then
+if auth_method == "bearer" and ModernAuth then
 --  local ua_Apple = string_find(ua, "Mac OS X", 1, true) or (string_find(ua, "Mail", 1, true) == 1 and string_find(ua, "Darwin", 1, true))
-    if bearer_local then
-        auth_flags = bor(auth_flags, AUTH_BEARER_LOCAL)
-    else
-        auth_flags = bor(auth_flags, AUTH_BEARER_MSX)
-    end
+    auth_flags = bor(auth_flags, AUTH_BEARER_MSX)
+end
+
+if (auth_method or "") == "" then
+    return abort(401, auth_flags, "Unauthorized: No credentials")
 end
 
 if (auth_payload or "") == "" then
@@ -247,7 +256,7 @@ end
 if auth_method == "bearer" then
     local jwt_obj = resty_jwt:load_jwt(auth_payload)
     if not jwt_obj.valid then
-        return abort(401, auth_flags, "Unauthorized: Invalid JWT", true)
+        return abort(401, auth_flags, "Unauthorized: Invalid JWT", false)
     end
     local jwt_iss = jwt_obj.payload["iss"]
 
@@ -263,7 +272,7 @@ if auth_method == "bearer" then
         local res, err = resty_openidc.bearer_jwt_verify(opts)
 
         if err then
-            return abort(401, auth_flags, "Unauthorized:" .. err, true)
+            return abort(401, auth_flags, "Unauthorized:" .. err, false)
         end
 
         -- Microsoft issued JWT is valid, passthrough to exchange.
@@ -282,7 +291,7 @@ if auth_method == "bearer" then
         local res, err, access_token = resty_openidc.bearer_jwt_verify(opts)
 
         if err then
-            return abort(401, auth_flags, "Unauthorized:" .. err, true)
+            return abort(401, auth_flags, "Unauthorized:" .. err, false)
         end
 
         local upn = res.krb5_principal
@@ -294,7 +303,7 @@ if auth_method == "bearer" then
         return
     end
 
-    return abort(401, auth_flags, "Unauthorized: Unknown Issuer\niss: " .. jwt_iss, true)
+    return abort(401, auth_flags, "Unauthorized: Unknown Issuer\niss: " .. jwt_iss, false)
 end
 
 
@@ -320,21 +329,21 @@ if not username or not password then
 end
 
 -- Keep this function up2date with msxauthapi API behaviour / functionality
-local function enc_and_cache_keys(is_trustedNetwork, username, password, is_ActiveSync, deviceId, deviceType)
+local function enc_and_cache_keys(trustedNetwork, username, password, activeSync, deviceId, deviceType)
     local mac, err = openssl_mac.new(MAC_KEY, "HMAC", nil, "sha256")
     if not mac then
         return nil, nil, err
     end
 
-    mac:update(is_trustedNetwork and "T" or "t")
-    mac:update(is_ActiveSync and "A" or "a")
+    mac:update(trustedNetwork and "T" or "t")
+    mac:update(activeSync and "A" or "a")
     mac:update("\0")
     mac:update(username)
     mac:update("\0")
     mac:update(password)
     mac:update("\0")
 
-    if is_ActiveSync then
+    if activeSync then
         mac:update(deviceId)
         mac:update("\0")
         mac:update(deviceType)
@@ -372,7 +381,7 @@ local enc_key, cache_key, err = enc_and_cache_keys(
     is_trustedNetwork,
     username,
     password,
-    is_ActiveSync,
+    false, --is_ActiveSync,
     deviceId,
     deviceType
 )
@@ -394,26 +403,70 @@ local http_res
 local api_json
 local api_obj
 local cached = false
+local api_lock
+local api_locked
 
--- Cached: Decrypt json from cache and use it as api response
-local encrypted_json = cache:get(cache_key)
-if encrypted_json then
-    api_json = aes_obj:decrypt(encrypted_json)
+-- Helper function to attempt cache lookup and decryption
+local function get_from_cache(key, aes)
+    local encrypted_json = cache:get(key)
+    if encrypted_json then
+        local json_str = aes:decrypt(encrypted_json)
+        if json_str then
+            local obj = cjson.decode(json_str)
+            return json_str, obj
+        else
+            ngx.log(ngx.ERR, "Failed to decrypt data. Key mismatch or corrupted cache.")
+        end
+    end
+    return nil, nil
+end
 
-    if not api_json then
-        ngx.log(ngx.ERR, "Failed to decrypt data. Key mismatch or corrupted cache.")
-    else
-        api_obj = cjson.decode(api_json)
-        -- Cached result: don't insert into cache again
-        cached = true
+local function release_lock()
+    if api_lock and api_locked then
+        api_lock:unlock()
+        api_locked = nil
     end
 end
 
--- Not cached: forward full request to Python fake/auth server
+local function unlock_and_abort(status, flags, msg)
+    release_lock()
+    return abort(status, flags, msg)
+end
+
+-- 1. Cached: Decrypt json from cache and use it as api response
+api_json, api_obj = get_from_cache(cache_key, aes_obj)
+if api_obj then
+    cached = true
+end
+
+-- 2. Not cached: lock for cache misses
+if not cached then
+    api_lock, err = resty_lock:new("locks", {
+        timeout = 5,  -- Wait up to 5s for lock
+        exptime = 10  -- Lock expires automatically after 10s if process dies
+    })
+
+    if api_lock then
+        api_locked, err = api_lock:lock("msxauth:" .. cache_key)
+    end
+
+    if api_locked then
+        -- 3. Double-Check Cache (Another request might have populated it while we waited)
+        api_json, api_obj = get_from_cache(cache_key, aes_obj)
+        if api_obj then
+            cached = true
+            release_lock()
+        end
+    else
+        ngx.log(ngx.WARN, "Failed to acquire lock for ", cache_key, ": ", err)
+    end
+end
+
+-- 4. Really not cached: forward full request to Python fake/auth server ONCE
 if not cached then
     local headers = ngx.req.get_headers()
     local body = nil
-    if is_ActiveSync then
+    if is_ActiveSync and false then
         ngx.req.read_body()
         body = ngx.req.get_body_data(1048576)
     end
@@ -423,48 +476,53 @@ if not cached then
     headers["X-Forwarded-For"] = ngx.var.remote_addr
     headers["X-Trusted-Network"] = is_trustedNetwork
 
+    -- Strip headers
+    headers["content-length"] = nil
+    headers["content-type"] = nil
+    headers["transfer-encoding"] = nil
+
     local httpc = resty_http.new()
     httpc:set_timeout(5000)
 
     -- Forward full/original request to Python Auth API
     http_res, err = httpc:request_uri("http://127.0.0.1:8000" .. ngx.var.uri, {
         method = ngx.req.get_method(),
-        body = body,
+        --body = body,
         query = ngx.var.args,
         headers = headers
     })
 
     if not http_res then
-        err = "Auth API error: " .. err
+        err = "Auth API error: " .. (err or "unknown failure")
         ngx.log(ngx.ERR, err)
-        return abort(500, nil, "Internal Server Error.\n" .. err)
+        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
     end
 
     local api_res = http_res.headers["X-API-Result"]
     if not api_res or api_res == "" then
         err = "Auth API error: Empty result"
         ngx.log(ngx.ERR, err)
-        return abort(500, nil, "Internal Server Error.\n" .. err)
+        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
     end
 
     api_json = ngx.decode_base64(api_res)
     if not api_json then
         err = "Auth API error: Invalid result (base64 decode failure)"
         ngx.log(ngx.ERR, err)
-        return abort(500, nil, "Internal Server Error.\n" .. err)
+        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
     end
 
     api_obj, err = cjson.decode(api_json)
     if err then
         err = "Auth API JSON error: " .. err
         ngx.log(ngx.ERR, err)
-        return abort(500, nil, "Internal Server Error.\n" .. err)
+        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
     end
 
     if api_obj["error"] then
         err = "Auth API returned error: " .. api_obj["error"]
         ngx.log(ngx.ERR, err)
-        return abort(500, nil, "Internal Server Error.\n" .. err)
+        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
     end
 end
 
@@ -473,12 +531,16 @@ if impersonate then
     -- Cache impersonate result
     if not cached then
         local ttl = impersonate["exp"] - ngx.time()
-        ttl = max(min(ttl, 3600), 0)
-        local encrypted_json = aes_obj:encrypt(api_json)
-        local ok, err = cache:set(cache_key, encrypted_json, ttl)
-        if not ok then
-            ngx.log(ngx.ERR, "Failed to store encrypted data in cache: ", err)
+        if ttl > 0 then
+            ttl = min(ttl, 3600)
+            local encrypted_json = aes_obj:encrypt(api_json)
+            local ok, err = cache:set(cache_key, encrypted_json, ttl)
+            if not ok then
+                ngx.log(ngx.ERR, "Failed to store encrypted data in cache: ", err)
+            end
         end
+
+        release_lock()
     end
 
     s4u2api.impersonate(impersonate["upn"], impersonate["jwt"])
@@ -489,17 +551,23 @@ elseif api_obj["abort"] then
     -- Cache abort result
     if not cached then
         local ttl = abort_["exp"] - ngx.time()
-        ttl = max(min(ttl, 3600), 0)
-        local encrypted_json = aes_obj:encrypt(api_json)
-        local ok, err = cache:set(cache_key, encrypted_json, ttl)
-        if not ok then
-            ngx.log(ngx.ERR, "Failed to store encrypted data in cache: ", err)
+        if ttl > 0 then
+            ttl = min(ttl, 3600)
+            local encrypted_json = aes_obj:encrypt(api_json)
+            local ok, err = cache:set(cache_key, encrypted_json, ttl)
+            if not ok then
+                ngx.log(ngx.ERR, "Failed to store encrypted data in cache: ", err)
+            end
         end
+
+        release_lock()
     end
 
     return abort(abort_["code"], auth_flags, abort_["msg"], (not cached and abort_["code"] == 401))
 
 elseif api_obj["return"] then
+    release_lock()
+
     -- Return response from Auth Proxy
     -- Use case: ActiveSync fake mail server for MFA device verification
     ngx.status = http_res.status
@@ -513,4 +581,4 @@ elseif api_obj["return"] then
 end
 
 ngx.log(ngx.ERR, "Auth API unhandled response: ", api_json)
-return abort(500, nil, "Internal Server Error.\nUnhandled Auth State")
+return unlock_and_abort(500, nil, "Internal Server Error.\nUnhandled Auth State")

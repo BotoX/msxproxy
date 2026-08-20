@@ -73,8 +73,6 @@ def _abort(status_code: int, msg: str, ttl: int):
     headers = {
         "X-API-Result": json_b64_header({"abort": abort}),
     }
-    if auth:
-        headers["WWW-Authenticate"] = "Basic"
 
     raise HTTPException(
         status_code=status_code,
@@ -125,7 +123,7 @@ async def authenticate_or_die(
     return access_token, claims
 
 
-@router.api_route("/Microsoft-Server-ActiveSync", methods=["GET", "POST", "OPTIONS"])
+#@router.api_route("/Microsoft-Server-ActiveSync", methods=["GET", "POST", "OPTIONS"])
 async def ActiveSync_API(
     request: Request,
     credentials: Annotated[HTTPBasicCredentials, Depends(basic_header)],
