@@ -46,8 +46,19 @@ class KeycloakOIDCClient:
 
         self._config: dict[str, any] = {}
         self._jwk_set: jwt.PyJWKSet | None = None
+        self._http_client: httpx.AsyncClient | None = None
 
         self._setup()
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=self.timeout)
+        return self._http_client
+
+    async def aclose(self) -> None:
+        if self._http_client is not None and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
 
     def _setup(self) -> None:
         with httpx.Client(timeout=self.timeout) as client:
@@ -123,29 +134,29 @@ class KeycloakOIDCClient:
             "X-Forwarded-For": user_ip
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            resp = await client.post(self.token_endpoint, data=data, headers=headers)
-            resp.raise_for_status()
+        client = self._get_http_client()
+        resp = await client.post(self.token_endpoint, data=data, headers=headers)
+        resp.raise_for_status()
 
-            # Check if CrowdSec served an HTML CAPTCHA / Challenge page
-            content_type = resp.headers.get("content-type", "")
-            if "text/html" in content_type and "<title>CrowdSec Captcha</title>" in resp.text:
-                logger.warning(
-                    "CrowdSec CAPTCHA triggered for client IP '%s' (user '%s')",
-                    user_ip,
-                    username
-                )
-                raise ForbiddenError("Authentication blocked by security policy (CrowdSec CAPTCHA)")
+        # Check if CrowdSec served an HTML CAPTCHA / Challenge page
+        content_type = resp.headers.get("content-type", "")
+        if "text/html" in content_type and "<title>CrowdSec Captcha</title>" in resp.text:
+            logger.warning(
+                "CrowdSec CAPTCHA triggered for client IP '%s' (user '%s')",
+                user_ip,
+                username
+            )
+            raise ForbiddenError("Authentication blocked by security policy (CrowdSec CAPTCHA)")
 
-            try:
-                return resp.json()
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(
-                    "Keycloak returned non-JSON response (status %s): %s",
-                    resp.status_code,
-                    resp.text[:500]  # Log up to 500 chars of body
-                )
-                raise OIDCError("Keycloak returned an invalid or empty response")
+        try:
+            return resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(
+                "Keycloak returned non-JSON response (status %s): %s",
+                resp.status_code,
+                resp.text[:500]  # Log up to 500 chars of body
+            )
+            raise OIDCError("Keycloak returned an invalid or empty response")
 
 
 def claims2principal(claims: dict[str, any]) -> str:

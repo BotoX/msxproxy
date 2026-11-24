@@ -4,7 +4,7 @@ import base64
 import logging
 
 from .s4u2api import s4u2api
-from .utils import sasl_security_layer
+from .utils import sasl_security_layer, has_buffered_data
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,9 @@ async def smtp_ensure_tls_and_ehlo(
     if not resp.startswith("220"):
         raise RuntimeError(f"SMTP STARTTLS failed: {resp}")
 
+    if has_buffered_data(reader):
+        raise RuntimeError("SMTP backend sent unexpected pipelined data after STARTTLS")
+
     # 4) Upgrade to TLS
     await writer.start_tls(ssl_context, server_hostname=hostname)
     logger.info("SMTP STARTTLS completed; connection upgraded to TLS")
@@ -177,22 +180,19 @@ async def smtp_gssapi_auth(
 
         security_layer_done = False
         while True:
-            line = await reader.readline()
-            if not line:
-                raise RuntimeError("SMTP backend closed during AUTH GSSAPI")
-            line_str = line.decode().rstrip("\r\n")
+            lines = await read_smtp_multiline_reply(reader)
+            line_str = lines[-1]
             logger.debug("SMTP GSSAPI recv: %r", line_str)
 
-            if line_str.startswith("235 "):
+            if line_str.startswith("235"):
                 logger.info("GSSAPI SMTP auth succeeded for %r", upn)
                 return True, line_str
-            if line_str.startswith("535 "):
+            if line_str.startswith(("4", "5")):
                 return False, line_str
 
-            if not line_str.startswith("334 "):
-                # Unexpected line, ignore or raise; we log and continue to be conservative.
+            if not line_str.startswith("334"):
                 logger.warning("Unexpected SMTP response during GSSAPI: %r", line_str)
-                continue
+                return False, line_str
 
             server_b64 = line_str[4:].strip()
             if not server_b64:

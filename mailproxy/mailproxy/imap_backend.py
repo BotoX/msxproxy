@@ -5,7 +5,7 @@ import ssl
 from dataclasses import dataclass
 
 from .s4u2api import s4u2api
-from .utils import sasl_security_layer
+from .utils import sasl_security_layer, has_buffered_data
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,9 @@ async def imap_ensure_tls(
             if not resp.status_or_data.upper().startswith("OK"):
                 raise RuntimeError(f"IMAP backend STARTTLS failed: {resp.raw}")
             break
+
+    if has_buffered_data(reader):
+        raise RuntimeError("IMAP backend sent unexpected pipelined data after STARTTLS")
 
     # Upgrade the connection to TLS in-place
     await writer.start_tls(ssl_context, server_hostname=hostname)

@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import tempfile
 import gssapi
 import krb5
 import hashlib
@@ -11,7 +12,7 @@ import traceback
 import unicodedata
 from functools import partial
 from filelock import AsyncUnixFileLock
-from contextlib import closing
+from contextlib import closing, suppress
 
 from .config import (
     KRB5_CLIENT_KTNAME,
@@ -109,11 +110,36 @@ class KerberosProxy:
             return None, None
 
     def _upn_ccache_path(self, upn: str) -> str:
+        user, sep, domain = upn.partition('@')
+        if not sep or '@' in domain:
+            raise ValueError(f'Invalid UPN: {upn!r}')
         upnhash = hashlib.md5(upn.encode()).hexdigest()[:8]
-        user, domain = upn.split('@')
         domain = domain.split('.', maxsplit=1)[0]
         safe_id = secure_filename(f'{domain}_{user}_{upnhash}')
         return f'{self.ccache_dir}/{safe_id}'
+
+    def _store_ccache_atomic(self, creds: gssapi.Credentials, ccache_path: str) -> None:
+        """
+        Write credentials to a 0600 temp file in ccache_dir and atomically replace
+        ccache_path so lock-free readers never observe a truncated/half-written file.
+        """
+        prefix = f'.{os.path.basename(ccache_path)}.'
+        with tempfile.NamedTemporaryFile(
+            dir=self.ccache_dir, prefix=prefix, suffix='.tmp', delete=False
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            creds.store(
+                usage='initiate',
+                store={'ccache': f'FILE:{tmp_path}'},
+                overwrite=True
+            )
+            os.replace(tmp_path, ccache_path)
+        except BaseException:
+            with suppress(OSError):
+                os.unlink(tmp_path)
+            raise
 
     async def create_context(self, upn: str, spn: str) -> tuple[gssapi.SecurityContext, str]:
         target_name = gssapi.Name(spn, gssapi.NameType.kerberos_principal)
@@ -129,6 +155,8 @@ class KerberosProxy:
             token = ctx.step()
             return ctx, token
 
+        # Fast path (lock-free): _store_ccache_atomic guarantees readers only ever
+        # see a complete inode, and valid cached tickets require no KDC network I/O.
         creds, creds_valid = self._krb5_get_creds(ccache_path, spn)
         if creds and creds_valid:
             return init_context(creds)
@@ -161,17 +189,9 @@ class KerberosProxy:
                 )
 
             # Get fresh service ticket from the KDC
-            ctx, token = await loop.run_in_executor(None,
-                partial(init_context,
-                    creds
-                )
-            )
+            ctx, token = await loop.run_in_executor(None, init_context, creds)
 
-            creds.store(
-                usage='initiate',
-                store={'ccache': f'FILE:{ccache_path}'},
-                overwrite=True
-            )
+            self._store_ccache_atomic(creds, ccache_path)
             return ctx, token
 
 

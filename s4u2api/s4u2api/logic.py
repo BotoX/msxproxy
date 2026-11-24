@@ -90,7 +90,8 @@ async def get_principal_cached(jwt_str: str, oidc_client: auth.KeycloakOIDCClien
                     exp = int(claims.get('exp', time.time() + 300))
                     ttl = max(1, exp - int(time.time()))
                 except Exception as e:
-                    logger.warning(f'JWT Verification failed for {jwt_hash}: {e}\n{jwt_str}')
+                    logger.warning('JWT Verification failed for %s: %s', jwt_hash, e)
+                    logger.debug('Failed JWT (%s): %s', jwt_hash, jwt_str)
                     traceback.print_exc()
                     principal = f'ERROR: {e}'
                     ttl = 60
@@ -142,7 +143,7 @@ async def client_message(msg: dict[str, any], ctx: gssapi.SecurityContext|None, 
 
     if step:
         if not ctx:
-            return ValueError('No context established!')
+            raise ValueError('No context established!')
         step = base64.b64decode(step)
         token = ctx.step(step)
     else:

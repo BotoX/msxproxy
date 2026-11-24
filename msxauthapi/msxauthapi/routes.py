@@ -185,9 +185,9 @@ async def ActiveSync_API(
     elif cmd == "getitemestimate":
         res = OnGetItemEstimate(xml)
     elif cmd == "sync":
-        subject = claims["preferred_username"]
-        email = claims["email"]
-        name = claims["name"]
+        subject = claims.get("preferred_username") or ""
+        email = claims.get("email") or ""
+        name = claims.get("name") or ""
         res = OnSync(
             xml,
             subject, email, name,

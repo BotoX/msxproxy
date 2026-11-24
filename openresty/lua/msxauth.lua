@@ -52,7 +52,7 @@ local is_ActiveSync = ((ngx.var.is_ActiveSync or "") == "1")
 local is_RPC = ((ngx.var.is_RPC or "") == "1")
 
 -- Is the client connection NTLM pinned? (already authorized on TCP level)
-local is_pinned = ((ngx.var.ntlm_pinned or "") ~= "")
+local is_pinned = ((ngx.var.ntlm_pinned_exchange_upstream or "") ~= "")
 
 local bearer_local = ((ngx.var.bearer_local or "") == "1")
 
@@ -208,6 +208,14 @@ if is_AutoDiscoverJSON then
     return ngx.exit(ngx.HTTP_OK)
 end
 
+-- Check if ip address is banned (before is_pinned so banned IPs cannot reuse pinned sockets)
+local banned, retry_after = ratelimit.check(ngx.var.remote_addr)
+if banned then
+    local retry_str = tostring(math.ceil(retry_after))
+    ngx.header["Retry-After"] = retry_str
+    return abort(429, nil, "Too many failed attempts. Try again in " .. retry_str .. " seconds.")
+end
+
 -- Authorization Header
 local auth_method, auth_payload = authorization.split_header(ngx.var.http_authorization)
 
@@ -240,14 +248,6 @@ end
 
 if (auth_payload or "") == "" then
     return abort(401, auth_flags, "Unauthorized: empty auth payload")
-end
-
--- Check if ip address is banned
-local banned, retry_after = ratelimit.check(ngx.var.remote_addr)
-if banned then
-    local retry_str = tostring(math.ceil(retry_after))
-    ngx.header["Retry-After"] = retry_str
-    return abort(429, nil, "Too many failed attempts. Try again in " .. retry_str .. " seconds.")
 end
 
 --
@@ -303,7 +303,7 @@ if auth_method == "bearer" then
         return
     end
 
-    return abort(401, auth_flags, "Unauthorized: Unknown Issuer\niss: " .. jwt_iss, false)
+    return abort(401, auth_flags, "Unauthorized: Unknown Issuer\niss: " .. tostring(jwt_iss), false)
 end
 
 
@@ -541,6 +541,7 @@ if impersonate then
         end
 
         release_lock()
+        ratelimit.on_success(ngx.var.remote_addr)
     end
 
     s4u2api.impersonate(impersonate["upn"], impersonate["jwt"])
@@ -577,7 +578,8 @@ elseif api_obj["return"] then
             ngx.header[k] = v
         end
     end
-    return ngx.print(http_res.body)
+    ngx.print(http_res.body)
+    return ngx.exit(http_res.status)
 end
 
 ngx.log(ngx.ERR, "Auth API unhandled response: ", api_json)

@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 
+from .utils import enable_tcp_keepalive
+
 
 async def relay(
     reader1: asyncio.StreamReader,
@@ -16,6 +18,9 @@ async def relay(
     to flush any in-flight data (e.g. a final IMAP untagged response sent
     by the server after the client exits IDLE) before being hard-cancelled.
     """
+
+    enable_tcp_keepalive(writer1)
+    enable_tcp_keepalive(writer2)
 
     async def pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
         try:

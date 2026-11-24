@@ -5,7 +5,7 @@ from ipaddress import ip_network
 # ---------------------------------------------------------
 
 S4U2API_HOST = "127.0.0.1"
-S4U2API_PORT = "7777"
+S4U2API_PORT = 7777
 
 # ---------------------------------------------------------
 # Exchange hosts / ports / caps

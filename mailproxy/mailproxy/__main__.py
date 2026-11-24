@@ -7,7 +7,7 @@ import argparse
 import multiprocessing
 import uvloop
 
-from . import config
+from . import auth, config
 from .imap_proxy import ImapProxyServer
 from .smtp_proxy import SmtpProxyServer
 from .loadbalancer import LoadBalancer
@@ -56,8 +56,13 @@ async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> N
     async with imap_srv, imaps_srv, smtp_srv, smtps_srv:
         await stop_event.wait()
 
-    # Stop load balancers
-    await asyncio.gather(imap_lb.cancel(), smtp_lb.cancel(), return_exceptions=True)
+    # Stop load balancers and shared HTTP client
+    await asyncio.gather(
+        imap_lb.cancel(),
+        smtp_lb.cancel(),
+        auth.oidc.aclose(),
+        return_exceptions=True,
+    )
 
     # Cancel and drain every in-flight connection task.
     current = asyncio.current_task()
@@ -132,10 +137,11 @@ def main() -> None:
 
     # Build TLS context once in the parent.  Workers inherit it via fork
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ssl_ctx.load_cert_chain(args.cert, args.key)
 
     # Bind all four sockets before forking so every worker shares the same
-    # file descriptions.  SO_REUSEPORT lets them all call accept() in parallel.
+    # listening file descriptors.
     socks = (
         _make_tcp_socket(config.LISTEN_IMAP_HOST,  config.LISTEN_IMAP_PORT),   # IMAP  STARTTLS  143
         _make_tcp_socket(config.LISTEN_IMAPS_HOST, config.LISTEN_IMAPS_PORT),  # IMAPS implicit  993

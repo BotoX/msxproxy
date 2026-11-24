@@ -6,7 +6,7 @@ import contextlib
 
 from . import config
 from .auth import OIDCError, TrustedNetworkError
-from .utils import AUTH_MECHS, sasl_auth_flow, close_writer
+from .utils import AUTH_MECHS, sasl_auth_flow, close_writer, has_buffered_data
 from .smtp_backend import smtp_ensure_tls_and_ehlo, smtp_gssapi_auth, smtp_login_auth
 from .relay import relay
 from .loadbalancer import LoadBalancer
@@ -63,9 +63,10 @@ class SmtpProxyServer:
                             # STARTTLS only if not already TLS and ssl_context available
                             if (not is_tls) and (self._ssl_ctx is not None):
                                 caps.insert(1, "STARTTLS")
+                                caps.extend(c for c in config.ESMTP_CAPS if c.upper() != "PIPELINING")
                             else:
                                 caps.append("AUTH " + " ".join(AUTH_MECHS))
-                            caps.extend(config.ESMTP_CAPS)
+                                caps.extend(config.ESMTP_CAPS)
 
                         for cap in caps[:-1]:
                             writer.write(f"250-{cap}\r\n".encode())
@@ -82,6 +83,12 @@ class SmtpProxyServer:
                             writer.write(b"454 4.7.0 TLS not available\r\n")
                             await writer.drain()
                             continue
+
+                        if has_buffered_data(reader):
+                            logger.warning("SMTP STARTTLS pipelined cleartext data from '%s'; closing connection", addr[0])
+                            writer.write(b"501 5.5.4 Command pipelining not allowed with STARTTLS\r\n")
+                            await writer.drain()
+                            return
 
                         writer.write(b"220 2.0.0 Ready to start TLS\r\n")
                         await writer.drain()
@@ -184,19 +191,19 @@ class SmtpProxyServer:
             writer.write(b"535 5.7.8 External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n")
             await writer.drain()
             return None, None
-        except (OIDCError, ValueError) as e:
-            logger.info("SMTP %s authentication failed from '%s': %s", mech, addr[0], e)
+        except (OIDCError, ValueError, UnicodeDecodeError) as e:
+            logger.info("SMTP %s authentication failed from '%s': %r", mech, addr[0], str(e))
             writer.write(b"535 5.7.8 Authentication credentials invalid\r\n")
             await writer.drain()
             return None, None
         except Exception as e:
             traceback.print_exc()
-            logger.warning("SMTP %s auth error: %s", mech, e)
+            logger.warning("SMTP %s auth error: %r", mech, str(e))
             writer.write(b"454 4.7.0 Unexpected authentication error\r\n")
             await writer.drain()
             return None, None
 
-        logger.info(f"SMTP ({mech}) authenticated {upn} (u={username}) (authzid={authzid})")
+        logger.info("SMTP (%s) authenticated %r (u=%r) (authzid=%r)", mech, upn, username, authzid)
 
         # --------------- BACKEND CONNECTION ---------------
         be_reader, be_writer, be_host, be_ssl_ctx = None, None, None, None

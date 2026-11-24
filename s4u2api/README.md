@@ -196,3 +196,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+## CCache Cleanup (`systemd-tmpfiles`)
+
+`/etc/tmpfiles.d/s4u2api.conf`
+```
+d /dev/shm/krb5_msxproxy 0700 s4u2api s4u2api 1d
+```
+
+Apply immediately with `systemd-tmpfiles --create /etc/tmpfiles.d/s4u2api.conf`. Files older than 24 hours (`1d`) are pruned automatically by `systemd-tmpfiles-clean.timer`.

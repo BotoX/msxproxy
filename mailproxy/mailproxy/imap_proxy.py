@@ -6,7 +6,7 @@ import contextlib
 
 from . import config
 from .auth import OIDCError, TrustedNetworkError
-from .utils import AUTH_MECHS, sasl_auth_flow, imap_login, close_writer
+from .utils import AUTH_MECHS, sasl_auth_flow, imap_login, close_writer, has_buffered_data
 from .imap_parser import ImapParser, ImapCommand
 from .imap_backend import (
     imap_gssapi_auth,
@@ -91,6 +91,12 @@ class ImapProxyServer:
                             writer.write(f"{tag} BAD TLS not available\r\n".encode())
                             await writer.drain()
                             continue
+
+                        if has_buffered_data(reader):
+                            logger.warning("IMAP STARTTLS pipelined cleartext data from '%s'; closing connection", addr[0])
+                            writer.write(f"{tag} BAD Command pipelining not allowed with STARTTLS\r\n".encode())
+                            await writer.drain()
+                            return
 
                         # RFC 3501: send tagged OK, then start TLS negotiation
                         writer.write(f"{tag} OK Begin TLS negotiation now\r\n".encode())
@@ -203,19 +209,19 @@ class ImapProxyServer:
             writer.write(f"{tag} NO [AUTHORIZATIONFAILED] External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n".encode())
             await writer.drain()
             return None, None
-        except (OIDCError, ValueError) as e:
-            logger.info("IMAP %s authentication failed from '%s': %s", mech, addr[0], e)
+        except (OIDCError, ValueError, UnicodeDecodeError) as e:
+            logger.info("IMAP %s authentication failed from '%s': %r", mech, addr[0], str(e))
             writer.write(f"{tag} NO [AUTHENTICATIONFAILED] Authentication credentials invalid\r\n".encode())
             await writer.drain()
             return None, None
         except Exception as e:
             traceback.print_exc()
-            logger.warning("IMAP %s auth error: %s", mech, e)
+            logger.warning("IMAP %s auth error: %r", mech, str(e))
             writer.write(f"{tag} NO [UNAVAILABLE] Unexpected authentication error\r\n".encode())
             await writer.drain()
             return None, None
 
-        logger.info(f"IMAP ({mech}) authenticated {upn} (u={username}) (authzid={authzid})")
+        logger.info("IMAP (%s) authenticated %r (u=%r) (authzid=%r)", mech, upn, username, authzid)
 
         # --------------- BACKEND CONNECTION ---------------
         be_reader, be_writer, be_host, be_ssl_ctx = None, None, None, None

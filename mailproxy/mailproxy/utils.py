@@ -4,6 +4,7 @@ import gssapi
 import base64
 import binascii
 import logging
+import socket
 
 from . import auth
 
@@ -179,7 +180,10 @@ async def sasl_auth_flow(
                 line = await reader.readline()
                 if not line:
                     raise EOFError()
-                xoauth_raw = base64.b64decode(line.strip())
+                line_stripped = line.strip()
+                if line_stripped == b"*":
+                    raise ValueError("SASL authentication cancelled by client")
+                xoauth_raw = base64.b64decode(line_stripped)
 
             # Parse and verify token
             if mech == "XOAUTH2":
@@ -206,7 +210,10 @@ async def sasl_auth_flow(
                 line = await reader.readline()
                 if not line:
                     raise EOFError()
-                plain_raw = base64.b64decode(line.strip())
+                line_stripped = line.strip()
+                if line_stripped == b"*":
+                    raise ValueError("SASL authentication cancelled by client")
+                plain_raw = base64.b64decode(line_stripped)
 
             authzid, username, password = parse_plain_payload(plain_raw)
 
@@ -228,7 +235,10 @@ async def sasl_auth_flow(
                 line = await reader.readline()
                 if not line:
                     raise EOFError()
-                username = base64.b64decode(line.strip()).decode()
+                line_stripped = line.strip()
+                if line_stripped == b"*":
+                    raise ValueError("SASL authentication cancelled by client")
+                username = base64.b64decode(line_stripped).decode()
 
             if mode == "smtp":
                 writer.write(b"334 UGFzc3dvcmQ6\r\n")
@@ -239,9 +249,17 @@ async def sasl_auth_flow(
             line = await reader.readline()
             if not line:
                 raise EOFError()
-            password = base64.b64decode(line.strip()).decode()
-    except binascii.Error as e:
-        raise ValueError(str(e))
+            line_stripped = line.strip()
+            if line_stripped == b"*":
+                raise ValueError("SASL authentication cancelled by client")
+            password = base64.b64decode(line_stripped).decode()
+
+            if not username:
+                raise ValueError("invalid LOGIN payload: missing username")
+            if not password:
+                raise ValueError("invalid LOGIN payload: missing password")
+    except (binascii.Error, UnicodeDecodeError) as e:
+        raise ValueError(f"invalid SASL payload: {e}")
 
     # Password-based verification (PLAIN / LOGIN)
     if username and password:
@@ -250,6 +268,9 @@ async def sasl_auth_flow(
 
     if claims:
         upn = auth.claims2principal(claims, ip_address)
+
+    if not upn or not jwt:
+        raise ValueError("authentication failed: missing principal or token")
 
     return upn, jwt, authzid, (username, password)
 
@@ -269,6 +290,23 @@ async def imap_login(
 
     upn = auth.claims2principal(claims, ip_address)
     return upn, jwt, None, (username, password)
+
+
+def has_buffered_data(reader: asyncio.StreamReader) -> bool:
+    """
+    Return True if StreamReader already holds unconsumed bytes.
+    Used before STARTTLS to reject pipelined plaintext command injection (CVE-2011-0411).
+    """
+    return bool(getattr(reader, "_buffer", None))
+
+
+def enable_tcp_keepalive(writer: asyncio.StreamWriter) -> None:
+    """Enable OS-default TCP keepalive probes (Linux default: 2h idle) on a socket."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    with contextlib.suppress(OSError, AttributeError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
 
 async def close_writer(writer: asyncio.StreamWriter, timeout: float = 2.0) -> None:
