@@ -5,10 +5,7 @@ import base64
 import logging
 
 from . import aionetstrings
-from .config import (
-    S4U2API_HOST,
-    S4U2API_PORT
-)
+from . import config as mp_config
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +77,19 @@ class S4U2ApiConnection:
 class S4U2ApiClient:
     def __init__(
         self,
-        host: str,
-        port: int
+        host: str | None = None,
+        port: int | None = None,
     ) -> None:
-        self.host = host
-        self.port = port
+        self._host = host
+        self._port = port
+
+    @property
+    def host(self) -> str:
+        return self._host if self._host is not None else mp_config.S4U2API_HOST
+
+    @property
+    def port(self) -> int:
+        return self._port if self._port is not None else mp_config.S4U2API_PORT
 
     @contextlib.asynccontextmanager
     async def connection(self):
@@ -98,7 +103,4 @@ class S4U2ApiClient:
             await writer.wait_closed()
 
 
-s4u2api = S4U2ApiClient(
-    host=S4U2API_HOST,
-    port=S4U2API_PORT
-)
+s4u2api = S4U2ApiClient()

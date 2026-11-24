@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 valkey_client = redis.Redis(
     unix_socket_path=VALKEY_SOCK,
     decode_responses=True,
-    retry_on_timeout=True,
     health_check_interval=30
 )
 

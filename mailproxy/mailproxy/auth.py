@@ -4,6 +4,7 @@ import jwt
 import ipaddress
 from jwt.exceptions import PyJWTError
 
+from . import config as mp_config
 from .config import (
     OIDC_WELL_KNOWN_URL,
     OIDC_AUDIENCE,
@@ -75,6 +76,25 @@ class KeycloakOIDCClient:
             resp = client.get(jwks_uri)
             resp.raise_for_status()
             self._jwk_set = jwt.PyJWKSet.from_dict(resp.json())
+
+    def reload_from_config(self) -> None:
+        """Reload OIDC settings from mailproxy.config and refresh discovery + JWKS."""
+        new_url = mp_config.OIDC_WELL_KNOWN_URL
+        with httpx.Client(timeout=self.timeout) as client:
+            resp = client.get(new_url)
+            resp.raise_for_status()
+            new_cfg = resp.json()
+
+            resp = client.get(new_cfg["jwks_uri"])
+            resp.raise_for_status()
+            new_jwks = jwt.PyJWKSet.from_dict(resp.json())
+
+        self.well_known_url = new_url
+        self.audience = mp_config.OIDC_AUDIENCE
+        self.client_id = mp_config.AUTH_CLIENT_ID
+        self.client_secret = mp_config.AUTH_CLIENT_SECRET
+        self._config = new_cfg
+        self._jwk_set = new_jwks
 
     @property
     def authorization_endpoint(self) -> str:

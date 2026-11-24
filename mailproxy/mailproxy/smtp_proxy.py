@@ -10,6 +10,7 @@ from .utils import AUTH_MECHS, sasl_auth_flow, close_writer, has_buffered_data
 from .smtp_backend import smtp_ensure_tls_and_ehlo, smtp_gssapi_auth, smtp_login_auth
 from .relay import relay
 from .loadbalancer import LoadBalancer
+from .metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ class SmtpProxyServer:
         is_tls = writer.get_extra_info("ssl_object") is not None
 
         logger.debug(f"SMTP client connected: {addr}, TLS={is_tls}")
+        metrics.inc("smtp", "conn_total")
+        metrics.inc("smtp", "conn_active")
 
         tries = 0
         be_reader = None
@@ -151,6 +154,7 @@ class SmtpProxyServer:
             pass
 
         finally:
+            metrics.dec("smtp", "conn_active")
             if be_writer:
                 await close_writer(be_writer)
             await close_writer(writer)
@@ -188,21 +192,25 @@ class SmtpProxyServer:
         except (EOFError, ConnectionResetError):  # Connection closed
             return None, None
         except TrustedNetworkError:
+            metrics.inc("smtp", "auth_trusted_network_denied")
             writer.write(b"535 5.7.8 External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n")
             await writer.drain()
             return None, None
         except (OIDCError, ValueError, UnicodeDecodeError) as e:
+            metrics.inc("smtp", "auth_failed")
             logger.info("SMTP %s authentication failed from '%s': %r", mech, addr[0], str(e))
             writer.write(b"535 5.7.8 Authentication credentials invalid\r\n")
             await writer.drain()
             return None, None
         except Exception as e:
+            metrics.inc("smtp", "auth_error")
             traceback.print_exc()
             logger.warning("SMTP %s auth error: %r", mech, str(e))
             writer.write(b"454 4.7.0 Unexpected authentication error\r\n")
             await writer.drain()
             return None, None
 
+        metrics.inc("smtp", "auth_ok")
         logger.info("SMTP (%s) authenticated %r (u=%r) (authzid=%r)", mech, upn, username, authzid)
 
         # --------------- BACKEND CONNECTION ---------------
@@ -213,6 +221,7 @@ class SmtpProxyServer:
         try:
             be_reader, be_writer, be_host, be_ssl_ctx = await self.lb.connect()
         except ConnectionError as e:
+            metrics.inc("smtp", "backend_error")
             logger.error(str(e))
             writer.write(b"454 4.7.0 Service unavailable; all backends down\r\n")
             await writer.drain()
@@ -249,6 +258,7 @@ class SmtpProxyServer:
                     raise RuntimeError(f"SMTP GSSAPI auth failed on backend: {last_line}")
 
         except Exception as e:
+            metrics.inc("smtp", "backend_error")
             traceback.print_exc()
             logger.error(f"Backend SMTP auth failed for {upn}: {e}")
             await close_writer(be_writer)

@@ -15,6 +15,7 @@ from .imap_backend import (
 )
 from .relay import relay
 from .loadbalancer import LoadBalancer
+from .metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ class ImapProxyServer:
         parser = ImapParser(reader, writer)
 
         logger.debug(f"IMAP client connected: {addr}, TLS={is_tls}")
+        metrics.inc("imap", "conn_total")
+        metrics.inc("imap", "conn_active")
 
         tries = 0
         be_reader = None
@@ -149,6 +152,7 @@ class ImapProxyServer:
             pass
 
         finally:
+            metrics.dec("imap", "conn_active")
             if be_writer:
                 await close_writer(be_writer)
             await close_writer(writer)
@@ -205,22 +209,26 @@ class ImapProxyServer:
         except (EOFError, ConnectionResetError):  # Connection closed
             return None, None
         except TrustedNetworkError:
+            metrics.inc("imap", "auth_trusted_network_denied")
             writer.write(b"* OK [ALERT] External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n")
             writer.write(f"{tag} NO [AUTHORIZATIONFAILED] External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n".encode())
             await writer.drain()
             return None, None
         except (OIDCError, ValueError, UnicodeDecodeError) as e:
+            metrics.inc("imap", "auth_failed")
             logger.info("IMAP %s authentication failed from '%s': %r", mech, addr[0], str(e))
             writer.write(f"{tag} NO [AUTHENTICATIONFAILED] Authentication credentials invalid\r\n".encode())
             await writer.drain()
             return None, None
         except Exception as e:
+            metrics.inc("imap", "auth_error")
             traceback.print_exc()
             logger.warning("IMAP %s auth error: %r", mech, str(e))
             writer.write(f"{tag} NO [UNAVAILABLE] Unexpected authentication error\r\n".encode())
             await writer.drain()
             return None, None
 
+        metrics.inc("imap", "auth_ok")
         logger.info("IMAP (%s) authenticated %r (u=%r) (authzid=%r)", mech, upn, username, authzid)
 
         # --------------- BACKEND CONNECTION ---------------
@@ -231,6 +239,7 @@ class ImapProxyServer:
         try:
             be_reader, be_writer, be_host, be_ssl_ctx = await self.lb.connect()
         except ConnectionError as e:
+            metrics.inc("imap", "backend_error")
             logger.error(str(e))
             writer.write(f"{tag} NO [UNAVAILABLE] All backends unavailable\r\n".encode())
             await writer.drain()
@@ -262,6 +271,7 @@ class ImapProxyServer:
                     tag_counter=tag_counter
                 )
         except Exception as e:
+            metrics.inc("imap", "backend_error")
             traceback.print_exc()
             logger.error(f"IMAP backend auth failed for {upn}: {e}")
             await close_writer(be_writer)

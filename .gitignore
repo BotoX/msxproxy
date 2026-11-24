@@ -1,0 +1,18 @@
+# Secrets, deployment config & local environment files (never commit!)
+openresty/lua/config.lua
+openresty/lua/secrets.lua
+.env
+*.env
+tests/.env
+
+# Keys, certificates & Kerberos keytabs
+*.key
+*.pem
+*.keytab
+
+# Python / testing artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/

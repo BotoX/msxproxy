@@ -2,18 +2,20 @@
 
 -- Modules
 local authorization = require("authorization")
+local config        = require("config")
+local keycloak      = require("keycloak")
 local s4u2api       = require("s4u2api")
 local resty_sha256  = require("resty.sha256")
 local resty_aes     = require("resty.aes")
 local openssl_mac   = require("resty.openssl.mac")
 local resty_string  = require("resty.string")
-local resty_http    = require("resty.http")
 local resty_jwt     = require("resty.jwt")
 local resty_openidc = require("resty.openidc")
 local resty_lock    = require("resty.lock")
 local cjson         = require("cjson")
 local bit           = require("bit")
 local ratelimit     = require("ratelimit")
+local metrics       = require("metrics")
 
 -- Locals for performance
 local ngx           = ngx
@@ -27,12 +29,20 @@ local string_find   = string.find
 local band, bor     = bit.band, bit.bor
 local min, max      = math.min, math.max
 
--- Secrets
-local OIDC_MSX = "https://sts.windows.net/a7c865db-16d5-4de3-8c05-b1e99d713376/"
-local OIDC_LOCAL = "https://login.uni-graz.at/auth/realms/UniGraz"
+-- Configuration / secrets (loaded from openresty/lua/config.lua)
+local MSX_TENANT_ID      = config.oidc.msx_tenant_id
+local OIDC_MSX           = "https://sts.windows.net/" .. MSX_TENANT_ID .. "/"
+local OIDC_LOCAL         = config.oidc.local_issuer:gsub("/+$", "")
+local OIDC_AUDIENCE      = config.oidc.audience
+local AUTH_CLIENT_ID     = config.oidc.direct_grant.client_id
+local AUTH_CLIENT_SECRET = config.oidc.direct_grant.client_secret
+local AUTH_TIMEOUT       = config.oidc.direct_grant.timeout or 5000
 
-local MAC_KEY = ngx.decode_base64("***")
-local API_SECRET = "***"
+local HOST_WEBMAIL       = config.hosts.webmail
+local HOST_EXCHANGE      = config.hosts.exchange
+local HOST_AUTODISCOVER  = config.hosts.autodiscover
+
+local MAC_KEY = ngx.decode_base64(config.mac_key_b64 or "")
 
 -- Are we inside the corporate network or VPN?
 local is_trustedNetwork = ((ngx.var.is_trustedNetwork or "") == "1")
@@ -45,9 +55,6 @@ local is_AutoDiscover = ((ngx.var.is_AutoDiscover or "") ~= "")
 local is_AutoDiscoverXML = ((ngx.var.is_AutoDiscover or "") == "xml")
 local is_AutoDiscoverJSON = ((ngx.var.is_AutoDiscover or "") == "json")
 local is_AutoDiscoverSVC = ((ngx.var.is_AutoDiscover or "") == "svc")
-
--- Is the client talking to the ActiveSync endpoint?
-local is_ActiveSync = ((ngx.var.is_ActiveSync or "") == "1")
 
 local is_RPC = ((ngx.var.is_RPC or "") == "1")
 
@@ -62,8 +69,8 @@ local AUTH_NTLM = 4
 local AUTH_BASIC = 8
 
 local CHALLENGES = {
-    bearer_msx = 'Bearer client_id="00000002-0000-0ff1-ce00-000000000000", trusted_issuers="00000001-0000-0000-c000-000000000000@a7c865db-16d5-4de3-8c05-b1e99d713376", token_types="app_asserted_user_v1 service_asserted_app_v1", authorization_uri="https://login.windows.net/common/oauth2/authorize"',
-    bearer_local = 'Bearer client_id="not_implemented", authorization_uri="https://login.uni-graz.at/common/v2.0/auth"',
+    bearer_msx = 'Bearer client_id="00000002-0000-0ff1-ce00-000000000000", trusted_issuers="00000001-0000-0000-c000-000000000000@' .. MSX_TENANT_ID .. '", token_types="app_asserted_user_v1 service_asserted_app_v1", authorization_uri="https://login.windows.net/common/oauth2/authorize"',
+    bearer_local = 'Bearer client_id="not_implemented", authorization_uri="' .. OIDC_LOCAL .. '/protocol/openid-connect/auth"',
     basic  = 'Basic realm="%s"',
     negotiate = 'Negotiate',
     ntlm = 'NTLM'
@@ -161,7 +168,7 @@ if is_AutoDiscoverXML then
     if ua_Thunderbird then
         ngx.status = 200
         ngx.header.content_type = 'text/xml; charset=utf-8'
-        return ngx.say([[<?xml version="1.0" encoding="utf-8"?>
+        ngx.say([[<?xml version="1.0" encoding="utf-8"?>
 <Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
   <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a">
     <Account>
@@ -170,6 +177,7 @@ if is_AutoDiscoverXML then
     </Account>
   </Response>
 </Autodiscover>]])
+        return ngx.exit(ngx.HTTP_OK)
     end
 end
 
@@ -184,22 +192,13 @@ if is_AutoDiscoverJSON then
     end
 
     local proto_key = string_lower(raw_proto)
-    local templates
-    if ModernAuth or is_testIP then
-        templates = {
-            default = [[{"Protocol":"%s","Url":"https://webmail.uni-graz.at/api"}]],
-            ews = [[{"Protocol":"%s","Url":"https://webmail.uni-graz.at/EWS/Exchange.asmx"}]],
-            activesync = [[{"Protocol":"%s","Url":"https://webmail.uni-graz.at/Microsoft-Server-ActiveSync"}]],
-            autodiscoverv1 = [[{"Protocol":"%s","Url":"https://autodiscover.uni-graz.at/autodiscover/autodiscover.xml"}]]
-        }
-    else
-        templates = {
-            default = [[{"Protocol":"%s","Url":"https://email.uni-graz.at/api"}]],
-            ews = [[{"Protocol":"%s","Url":"https://email.uni-graz.at/EWS/Exchange.asmx"}]],
-            activesync = [[{"Protocol":"%s","Url":"https://email.uni-graz.at/Microsoft-Server-ActiveSync"}]],
-            autodiscoverv1 = [[{"Protocol":"%s","Url":"https://autodiscover.uni-graz.at/autodiscover/autodiscover.xml"}]]
-        }
-    end
+    local target_host = (ModernAuth or is_testIP) and HOST_WEBMAIL or HOST_EXCHANGE
+    local templates = {
+        default        = [[{"Protocol":"%s","Url":"https://]] .. target_host .. [[/api"}]],
+        ews            = [[{"Protocol":"%s","Url":"https://]] .. target_host .. [[/EWS/Exchange.asmx"}]],
+        activesync     = [[{"Protocol":"%s","Url":"https://]] .. target_host .. [[/Microsoft-Server-ActiveSync"}]],
+        autodiscoverv1 = [[{"Protocol":"%s","Url":"https://]] .. HOST_AUTODISCOVER .. [[/autodiscover/autodiscover.xml"}]]
+    }
 
     local template = templates[proto_key] or templates.default
     local response = string_format(template, raw_proto)
@@ -211,6 +210,7 @@ end
 -- Check if ip address is banned (before is_pinned so banned IPs cannot reuse pinned sockets)
 local banned, retry_after = ratelimit.check(ngx.var.remote_addr)
 if banned then
+    metrics.inc("msxproxy_auth_total", { method = "any", result = "429" })
     local retry_str = tostring(math.ceil(retry_after))
     ngx.header["Retry-After"] = retry_str
     return abort(429, nil, "Too many failed attempts. Try again in " .. retry_str .. " seconds.")
@@ -221,6 +221,7 @@ local auth_method, auth_payload = authorization.split_header(ngx.var.http_author
 
 -- Skip re-auth logic if we already have an NTLM-pinned upstream for this connection.
 if is_pinned then
+    metrics.inc("msxproxy_auth_total", { method = "pinned", result = "ok" })
     if auth_method ~= "ntlm" and auth_method ~= "negotiate" then
         -- Clear Authorization from client unless it's NTLM or Negotiate
         ngx.req.set_header("Authorization", "")
@@ -272,10 +273,12 @@ if auth_method == "bearer" then
         local res, err = resty_openidc.bearer_jwt_verify(opts)
 
         if err then
+            metrics.inc("msxproxy_auth_total", { method = "bearer_msx", result = "401" })
             return abort(401, auth_flags, "Unauthorized:" .. err, false)
         end
 
         -- Microsoft issued JWT is valid, passthrough to exchange.
+        metrics.inc("msxproxy_auth_total", { method = "bearer_msx", result = "ok" })
         return
     end
 
@@ -291,18 +294,22 @@ if auth_method == "bearer" then
         local res, err, access_token = resty_openidc.bearer_jwt_verify(opts)
 
         if err then
+            metrics.inc("msxproxy_auth_total", { method = "bearer_local", result = "401" })
             return abort(401, auth_flags, "Unauthorized:" .. err, false)
         end
 
         local upn = res.krb5_principal
         if not upn then
+            metrics.inc("msxproxy_auth_total", { method = "bearer_local", result = "500" })
             return abort(500, nil, "Internal Server Error.\nkrb5_principal not found in claims.")
         end
 
         s4u2api.impersonate(upn, access_token)
+        metrics.inc("msxproxy_auth_total", { method = "bearer_local", result = "ok" })
         return
     end
 
+    metrics.inc("msxproxy_auth_total", { method = "bearer", result = "401" })
     return abort(401, auth_flags, "Unauthorized: Unknown Issuer\niss: " .. tostring(jwt_iss), false)
 end
 
@@ -313,9 +320,11 @@ end
 if auth_method == "negotiate" or auth_method == "ntlm" then
     -- Passthrough legacy auth to exchange on trusted networks
     if is_trustedNetwork then
+        metrics.inc("msxproxy_auth_total", { method = "ntlm", result = "ok" })
         return
     end
 
+    metrics.inc("msxproxy_auth_total", { method = "ntlm", result = "403" })
     return abort(403, nil, "Legacy authentication not allowed from this network.")
 end
 
@@ -328,27 +337,18 @@ if not username or not password then
     return abort(401, auth_flags, "Unauthorized: " .. err)
 end
 
--- Keep this function up2date with msxauthapi API behaviour / functionality
-local function enc_and_cache_keys(trustedNetwork, username, password, activeSync, deviceId, deviceType)
+local function enc_and_cache_keys(trustedNetwork, username, password)
     local mac, err = openssl_mac.new(MAC_KEY, "HMAC", nil, "sha256")
     if not mac then
         return nil, nil, err
     end
 
     mac:update(trustedNetwork and "T" or "t")
-    mac:update(activeSync and "A" or "a")
     mac:update("\0")
     mac:update(username)
     mac:update("\0")
     mac:update(password)
     mac:update("\0")
-
-    if activeSync then
-        mac:update(deviceId)
-        mac:update("\0")
-        mac:update(deviceType)
-        mac:update("\0")
-    end
 
     local raw_mac, err = mac:final()
     if not raw_mac then
@@ -369,21 +369,11 @@ local function enc_and_cache_keys(trustedNetwork, username, password, activeSync
     return enc_key, cache_key, nil
 end
 
-local deviceId = nil
-local deviceType = nil
-if is_ActiveSync then
-    deviceId = ngx.var.arg_deviceid or ""
-    deviceType = ngx.var.arg_devicetype or ""
-end
-
 local cache = ngx.shared.auth_cache
 local enc_key, cache_key, err = enc_and_cache_keys(
     is_trustedNetwork,
     username,
-    password,
-    false, --is_ActiveSync,
-    deviceId,
-    deviceType
+    password
 )
 
 if not enc_key or not cache_key or err then
@@ -399,7 +389,6 @@ if not aes_obj then
     return abort(500, nil, "Internal Server Error.")
 end
 
-local http_res
 local api_json
 local api_obj
 local cached = false
@@ -428,15 +417,11 @@ local function release_lock()
     end
 end
 
-local function unlock_and_abort(status, flags, msg)
-    release_lock()
-    return abort(status, flags, msg)
-end
-
--- 1. Cached: Decrypt json from cache and use it as api response
+-- 1. Cached: Decrypt json from cache and use it as auth result
 api_json, api_obj = get_from_cache(cache_key, aes_obj)
 if api_obj then
     cached = true
+    metrics.inc("msxproxy_auth_cache_total", { result = "hit" })
 end
 
 -- 2. Not cached: lock for cache misses
@@ -462,75 +447,26 @@ if not cached then
     end
 end
 
--- 4. Really not cached: forward full request to Python fake/auth server ONCE
+-- 4. Really not cached: validate credentials via Keycloak Direct Grant ONCE
 if not cached then
-    local headers = ngx.req.get_headers()
-    local body = nil
-    if is_ActiveSync and false then
-        ngx.req.read_body()
-        body = ngx.req.get_body_data(1048576)
-    end
+    metrics.inc("msxproxy_auth_cache_total", { result = "miss" })
+    api_obj = keycloak.authenticate_basic({
+        discovery     = OIDC_LOCAL .. "/.well-known/openid-configuration",
+        audience      = OIDC_AUDIENCE,
+        client_id     = AUTH_CLIENT_ID,
+        client_secret = AUTH_CLIENT_SECRET,
+        cache_segment = "msxauth:uni",
+        timeout       = AUTH_TIMEOUT,
+    }, username, password, ngx.var.remote_addr, is_trustedNetwork)
 
-    -- API Authorization
-    headers["X-API-Secret"] = API_SECRET
-    headers["X-Forwarded-For"] = ngx.var.remote_addr
-    headers["X-Trusted-Network"] = is_trustedNetwork
-
-    -- Strip headers
-    headers["content-length"] = nil
-    headers["content-type"] = nil
-    headers["transfer-encoding"] = nil
-
-    local httpc = resty_http.new()
-    httpc:set_timeout(5000)
-
-    -- Forward full/original request to Python Auth API
-    http_res, err = httpc:request_uri("http://127.0.0.1:8000" .. ngx.var.uri, {
-        method = ngx.req.get_method(),
-        --body = body,
-        query = ngx.var.args,
-        headers = headers
-    })
-
-    if not http_res then
-        err = "Auth API error: " .. (err or "unknown failure")
-        ngx.log(ngx.ERR, err)
-        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
-    end
-
-    local api_res = http_res.headers["X-API-Result"]
-    if not api_res or api_res == "" then
-        err = "Auth API error: Empty result"
-        ngx.log(ngx.ERR, err)
-        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
-    end
-
-    api_json = ngx.decode_base64(api_res)
-    if not api_json then
-        err = "Auth API error: Invalid result (base64 decode failure)"
-        ngx.log(ngx.ERR, err)
-        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
-    end
-
-    api_obj, err = cjson.decode(api_json)
-    if err then
-        err = "Auth API JSON error: " .. err
-        ngx.log(ngx.ERR, err)
-        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
-    end
-
-    if api_obj["error"] then
-        err = "Auth API returned error: " .. api_obj["error"]
-        ngx.log(ngx.ERR, err)
-        return unlock_and_abort(500, nil, "Internal Server Error.\n" .. err)
-    end
+    api_json = cjson.encode(api_obj)
 end
 
 local impersonate = api_obj["impersonate"]
 if impersonate then
     -- Cache impersonate result
     if not cached then
-        local ttl = impersonate["exp"] - ngx.time()
+        local ttl = (impersonate["exp"] or 0) - ngx.time()
         if ttl > 0 then
             ttl = min(ttl, 3600)
             local encrypted_json = aes_obj:encrypt(api_json)
@@ -545,13 +481,14 @@ if impersonate then
     end
 
     s4u2api.impersonate(impersonate["upn"], impersonate["jwt"])
+    metrics.inc("msxproxy_auth_total", { method = "basic", result = "ok" })
     return
 
 elseif api_obj["abort"] then
     local abort_ = api_obj["abort"]
     -- Cache abort result
     if not cached then
-        local ttl = abort_["exp"] - ngx.time()
+        local ttl = (abort_["exp"] or 0) - ngx.time()
         if ttl > 0 then
             ttl = min(ttl, 3600)
             local encrypted_json = aes_obj:encrypt(api_json)
@@ -564,23 +501,10 @@ elseif api_obj["abort"] then
         release_lock()
     end
 
+    metrics.inc("msxproxy_auth_total", { method = "basic", result = tostring(abort_["code"]) })
     return abort(abort_["code"], auth_flags, abort_["msg"], (not cached and abort_["code"] == 401))
-
-elseif api_obj["return"] then
-    release_lock()
-
-    -- Return response from Auth Proxy
-    -- Use case: ActiveSync fake mail server for MFA device verification
-    ngx.status = http_res.status
-    for k, v in pairs(http_res.headers) do
-        local lk = string_lower(k)
-        if lk ~= "transfer-encoding" and lk ~= "connection" and k ~= "X-API-Result" then
-            ngx.header[k] = v
-        end
-    end
-    ngx.print(http_res.body)
-    return ngx.exit(http_res.status)
 end
 
-ngx.log(ngx.ERR, "Auth API unhandled response: ", api_json)
-return unlock_and_abort(500, nil, "Internal Server Error.\nUnhandled Auth State")
+release_lock()
+ngx.log(ngx.ERR, "Auth unhandled response: ", api_json)
+return abort(500, nil, "Internal Server Error.\nUnhandled Auth State")

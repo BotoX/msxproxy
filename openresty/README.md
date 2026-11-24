@@ -21,9 +21,23 @@ For Microsoft Exchange Proxy
     lua_shared_dict introspection 100m;
 
     lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+    lua_ssl_verify_depth 3;
 
     lua_package_path "$prefix/conf/lua/?.lua;;";
 ```
+
+## Configuration & Secrets
+
+All example configs live in `deploy/etc/`. Copy `deploy/etc/config.lua.example` to `/etc/msxproxy/config.lua` (`chmod 0640`, or run `sudo ./deploy/deploy.sh install`) and fill in hostnames, OIDC issuer/client IDs, client secrets, `mac_key_b64`, `owa.session_secret`, and optional `s4u2api`/`ratelimit` settings.
+
+## Prometheus Metrics
+
+`webmail.conf` declares `lua_shared_dict metrics 1m;` and exposes Prometheus metrics on `/metrics` (restricted to the same internal IP allowlist as `/status`):
+- `msxproxy_auth_total{method,result}`
+- `msxproxy_auth_cache_total{result}`
+- `msxproxy_ratelimit_bans_total`
+- `msxproxy_crowdsec_blocks_total{type}`
+- `msxproxy_s4u2api_requests_total{result}`
 
 ## Dependencies
 

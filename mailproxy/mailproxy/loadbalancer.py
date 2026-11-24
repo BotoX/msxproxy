@@ -17,6 +17,10 @@ class Backend:
         self.failures = 0
         self.successes = 0
 
+    @property
+    def key(self) -> tuple[str, int, bool]:
+        return (self.host, self.port, self.is_tls)
+
     def mark_failed(self, fall_threshold: int):
         self.failures += 1
         self.successes = 0
@@ -36,7 +40,7 @@ class LoadBalancer:
     def __init__(self, name: str, backends: list[tuple[str, int, bool]]):
         self.name = name
         self.backends = [Backend(name, h, p, t) for h, p, t in backends]
-        self._cycle = cycle(self.backends)
+        self._cycle = cycle(self.backends) if self.backends else iter(())
         self._ssl_ctx = ssl.create_default_context()
         self._task = None
 
@@ -52,14 +56,65 @@ class LoadBalancer:
             self._task.cancel()
             return self._task
 
+    async def _probe(self, backend: Backend, init: bool = False) -> None:
+        try:
+            async with asyncio.timeout(config.LB_TIMEOUT):
+                reader, writer = await asyncio.open_connection(
+                    backend.host,
+                    backend.port,
+                    ssl=self._ssl_ctx if backend.is_tls else None,
+                )
+                writer.close()
+                await writer.wait_closed()
+
+            backend.mark_success(1 if init else config.LB_RISE)
+        except Exception as e:
+            logger.debug(f"[{self.name}] Health check failed for {backend.host}:{backend.port} - {e}")
+            backend.mark_failed(config.LB_FALL)
+
+    async def reload(self, backends: list[tuple[str, int, bool]]) -> None:
+        """
+        Hot-reload backend list for new connections without affecting active sessions.
+        Preserves UP/DOWN state of unchanged backends and immediately probes newly added ones.
+        """
+        if not backends:
+            logger.error(f"[{self.name}] Refusing to reload empty backend list; keeping existing backends.")
+            return
+
+        existing = {b.key: b for b in self.backends}
+        updated: list[Backend] = []
+        newly_added: list[Backend] = []
+
+        for h, p, t in backends:
+            key = (h, p, t)
+            if key in existing:
+                updated.append(existing[key])
+            else:
+                b = Backend(self.name, h, p, t)
+                updated.append(b)
+                newly_added.append(b)
+
+        if newly_added:
+            await asyncio.gather(*(self._probe(b, init=True) for b in newly_added))
+
+        removed = [b for b in self.backends if b.key not in {u.key for u in updated}]
+        self.backends = updated
+        self._cycle = cycle(self.backends)
+
+        logger.info(
+            f"[{self.name}] Reloaded backends: {len(updated)} total "
+            f"(+{len(newly_added)} added, -{len(removed)} removed)."
+        )
+
     async def connect(
         self,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter, str, ssl.SSLContext]:
         """
         Attempts to connect to healthy backends in round-robin order.
-        Returns (reader, writer, host) or raises ConnectionError if all fail.
+        Returns (reader, writer, host, ssl_ctx) or raises ConnectionError if all fail.
         """
-        for _ in range(len(self.backends)):
+        backends = self.backends
+        for _ in range(len(backends)):
             backend = next(self._cycle)
             if not backend.is_up:
                 continue
@@ -69,7 +124,7 @@ class LoadBalancer:
                     reader, writer = await asyncio.open_connection(
                         backend.host,
                         backend.port,
-                        ssl=self._ssl_ctx if backend.is_tls else None
+                        ssl=self._ssl_ctx if backend.is_tls else None,
                     )
 
                 backend.mark_success(config.LB_RISE)
@@ -85,21 +140,8 @@ class LoadBalancer:
     async def worker(self, init=False):
         """Active health check: background task that probes servers."""
         while True:
-            for backend in self.backends:
-                try:
-                    async with asyncio.timeout(config.LB_TIMEOUT):
-                        reader, writer = await asyncio.open_connection(
-                            backend.host,
-                            backend.port,
-                            ssl=self._ssl_ctx if backend.is_tls else None
-                        )
-                        writer.close()
-                        await writer.wait_closed()
-
-                    backend.mark_success(1 if init else config.LB_RISE)
-                except Exception as e:
-                    logger.debug(f"[{self.name}] Health check failed for {backend.host}:{backend.port} - {e}")
-                    backend.mark_failed(config.LB_FALL)
+            for backend in list(self.backends):
+                await self._probe(backend, init=init)
 
             if init:
                 break

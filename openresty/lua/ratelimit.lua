@@ -31,15 +31,19 @@
 
 local _M = {}
 
-local ngx = ngx
-local min = math.min
+local ngx     = ngx
+local min     = math.min
+local metrics = require("metrics")
 
 -- ── Configuration ────────────────────────────────────────────────────────────
 
-local BASE_BANTIME = 60                              -- seconds (1 minute)
-local FINDTIME     = 12 * 3600                       -- seconds (12 hours)
-local MAXRETRY     = 15
-local MAX_BANTIME  = 15 * 60                         -- seconds (15 minutes)
+local ok_cfg, config = pcall(require, "config")
+local rl_cfg = (ok_cfg and config and config.ratelimit) or {}
+
+local BASE_BANTIME = rl_cfg.base_bantime or 60        -- seconds (1 minute)
+local FINDTIME     = rl_cfg.findtime     or 12 * 3600 -- seconds (12 hours)
+local MAXRETRY     = rl_cfg.maxretry     or 15
+local MAX_BANTIME  = rl_cfg.max_bantime  or 15 * 60   -- seconds (15 minutes)
 local MULTIPLIERS  = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 
 local STORE = ngx.shared.auth_failures
@@ -115,6 +119,7 @@ function _M.on_failure(ip)
             )
 
             STORE:set(ban_key, new_bans, FINDTIME, banned_until)
+            metrics.inc("msxproxy_ratelimit_bans_total")
             return true, duration
         end
 

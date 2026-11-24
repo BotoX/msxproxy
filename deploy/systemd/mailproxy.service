@@ -1,0 +1,26 @@
+[Unit]
+Description=OAuth2Mail-Proxy Python IMAP/SMTP Server
+After=network.target s4u2api.service
+Wants=s4u2api.service
+
+[Service]
+Type=simple
+User=mailproxy
+Group=mailproxy
+
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ProtectSystem=strict
+PrivateTmp=yes
+
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+WorkingDirectory=/opt/msxproxy/mailproxy
+ExecStart=/usr/bin/python3 -m mailproxy --config /etc/msxproxy/mailproxy.toml --metrics-host 127.0.0.1 --metrics-port 9101
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

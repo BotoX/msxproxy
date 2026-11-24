@@ -1,0 +1,37 @@
+# /etc/msxproxy/s4u2api.toml  (chmod 0640, root:s4u2api)
+#
+# Configuration for s4u2api (Kerberos S4U2Self / S4U2Proxy daemon).
+# Restart s4u2api after editing (`systemctl restart s4u2api`).
+
+# ---------------------------------------------------------
+# Keycloak / JWT verification
+# ---------------------------------------------------------
+[oidc]
+well_known_url = "https://login.uni-graz.at/auth/realms/UniGraz/.well-known/openid-configuration"
+audience       = "https_webmail.uni-graz.at"
+
+# ---------------------------------------------------------
+# Valkey / Redis JWT verification cache
+# ---------------------------------------------------------
+[valkey]
+# Unix domain socket path for Valkey in RAM (/dev/shm)
+socket = "/dev/shm/valkey.sock"
+
+# ---------------------------------------------------------
+# Kerberos S4U2Proxy settings
+# ---------------------------------------------------------
+[kerberos]
+# Service account principal with Constrained Delegation rights in AD
+principal  = "_msxproxy@PERS.AD.UNI-GRAZ.AT"
+
+# RAM-backed directory for per-user Kerberos ticket caches (pruned daily via tmpfiles.d)
+ccache_dir = "/dev/shm/krb5_msxproxy"
+
+# Fallback keytab path when not running under systemd LoadCredential=krb5_keytab:...
+keytab     = "FILE:/etc/msxproxy/krb5_keytab"
+
+# ---------------------------------------------------------
+# Allowed target Exchange Service Principal Names (short name -> full SPN)
+# ---------------------------------------------------------
+[valid_spns]
+http = "http/email.uni-graz.at@PERS.AD.UNI-GRAZ.AT"

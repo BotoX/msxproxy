@@ -30,8 +30,10 @@ PrivateTmp=yes
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
-WorkingDirectory=/opt/mailproxy
-ExecStart=/usr/bin/python3 -m mailproxy
+WorkingDirectory=/opt/msxproxy/mailproxy
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m mailproxy --config /etc/msxproxy/mailproxy.toml --metrics-host 127.0.0.1 --metrics-port 9101
+ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always
 RestartSec=5
@@ -39,6 +41,12 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 ```
+
+All configuration and secrets live in `/etc/msxproxy/mailproxy.toml` (template at `deploy/etc/mailproxy.toml.example`, `chmod 0640 root:mailproxy`).
+
+`systemctl reload mailproxy` (`SIGHUP`) hot-reloads `mailproxy.toml` (trusted networks, caps, timeouts, OIDC credentials), refreshes Keycloak JWKS, and reloads TLS certificates without dropping active IMAP/SMTP connections.
+
+When `--metrics-port` is specified, Prometheus metrics are served at `http://<metrics-host>:<metrics-port>/metrics` (`mailproxy_connections_total`, `mailproxy_connections_active`, `mailproxy_auth_total`, `mailproxy_backend_errors_total`, `mailproxy_backend_up`).
 
 ## Fail2Ban
 

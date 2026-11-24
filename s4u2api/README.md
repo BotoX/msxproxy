@@ -159,11 +159,7 @@ loglevel notice
 ```
 
 ```
-apt install python3-uvloop python3-gssapi python3-jwt python3-httpx python3-redis krb5-user
-
-apt install python3-pip python3-dev libkrb5-dev
-pip install krb5 --break-system-packages
-pip install filelock --break-system-packages
+apt install python3-uvloop python3-gssapi python3-jwt python3-httpx python3-redis python3-filelock krb5-user
 ```
 
 ## SystemD Service

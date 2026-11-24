@@ -1,0 +1,123 @@
+# /etc/msxproxy/mailproxy.toml  (chmod 0640, root:mailproxy)
+#
+# Full configuration & secrets for mailproxy (IMAP/IMAPS/SMTP/SMTPS).
+#
+# Hot reload (`systemctl reload mailproxy` / SIGHUP):
+#   Supported for: TLS cert/key files, [oidc] credentials & JWKS,
+#                  [proxy] settings & trusted_networks, [s4u2api],
+#                  [imap] & [smtp] backends (for new connections) and caps,
+#                  and [loadbalancer] thresholds.
+#   Requires restart: listen hosts/ports.
+
+# ---------------------------------------------------------
+# S4U2Api (Kerberos impersonation daemon)
+# ---------------------------------------------------------
+[s4u2api]
+host = "127.0.0.1"
+port = 7777
+
+# ---------------------------------------------------------
+# Keycloak / JWT / Authentication
+# ---------------------------------------------------------
+[oidc]
+well_known_url = "https://login.uni-graz.at/auth/realms/UniGraz/.well-known/openid-configuration"
+audience       = "https_webmail.uni-graz.at"
+client_id      = "https_webmail.uni-graz.at_DirectGrant"
+client_secret  = "CHANGE_ME"
+
+# ---------------------------------------------------------
+# Proxy general settings & TLS
+# ---------------------------------------------------------
+[proxy]
+# Public-facing hostname of the proxy for IMAP/SMTP greetings
+hostname = "mailproxy.uni-graz.at"
+
+# EHLO / server name for outbound SMTP (what proxy presents to Exchange)
+ehlo = "mailproxy.uni-graz.at"
+
+# Close unauthenticated connections after this timeout (seconds)
+auth_timeout = 60
+
+# TLS certificate & private key pairs for client-facing listeners (reloaded on SIGHUP).
+# Supports dual-cert setups (e.g., ECDSA + RSA) just like Nginx; OpenSSL selects
+# the best matching certificate per client handshake.
+certs = [
+    { cert = "/etc/msxproxy/mailproxy-ec-384.pem",   key = "/etc/msxproxy/mailproxy-ec-384.key" },
+    { cert = "/etc/msxproxy/mailproxy-rsa-3072.pem", key = "/etc/msxproxy/mailproxy-rsa-3072.key" },
+]
+
+# Networks allowed to authenticate with regular passwords (outside requires mail-password ACR)
+trusted_networks = [
+    "143.50.0.0/16",
+    "10.0.0.0/8",
+]
+
+# ---------------------------------------------------------
+# IMAP listeners, backends & advertised capabilities
+# ---------------------------------------------------------
+[imap]
+listen_host = "0.0.0.0"     # STARTTLS-capable/plain port
+listen_port = 143
+imaps_host  = "0.0.0.0"     # implicit TLS
+imaps_port  = 993
+
+# Exchange IMAP backends (hot-reloaded on SIGHUP for new connections)
+backends = [
+    { host = "ex19ms01.uni-graz.at", port = 993, tls = true },
+    { host = "ex19ms02.uni-graz.at", port = 993, tls = true },
+    { host = "ex19ms03.uni-graz.at", port = 993, tls = true },
+    { host = "ex19ms04.uni-graz.at", port = 993, tls = true },
+]
+
+caps = [
+    "IMAP4",
+    "IMAP4rev1",
+    "UIDPLUS",
+    "MOVE",
+    "ID",
+    "UNSELECT",
+    "CHILDREN",
+    "IDLE",
+    "NAMESPACE",
+    "LITERAL+",
+]
+
+# ---------------------------------------------------------
+# SMTP listeners, backends & advertised capabilities
+# ---------------------------------------------------------
+[smtp]
+listen_host = "0.0.0.0"     # STARTTLS-capable/plain port
+listen_port = 587
+smtps_host  = "0.0.0.0"     # implicit TLS
+smtps_port  = 465
+
+# Exchange SMTP backends (hot-reloaded on SIGHUP for new connections; STARTTLS is enforced when tls = false)
+backends = [
+    { host = "ex19ms01.uni-graz.at", port = 587, tls = false },
+    { host = "ex19ms02.uni-graz.at", port = 587, tls = false },
+    { host = "ex19ms03.uni-graz.at", port = 587, tls = false },
+    { host = "ex19ms04.uni-graz.at", port = 587, tls = false },
+]
+
+caps = [
+    "SIZE 104857600",
+    "PIPELINING",
+    "DSN",
+    "ENHANCEDSTATUSCODES",
+    "X-ANONYMOUSTLS",
+    "8BITMIME",
+    "BINARYMIME",
+    "CHUNKING",
+    "XEXCH50",
+    "XRDST",
+    "XSHADOWREQUEST",
+]
+
+# ---------------------------------------------------------
+# Load Balancer health checks
+# ---------------------------------------------------------
+[loadbalancer]
+check_interval = 10.0       # 'inter': Seconds between active health checks
+fall           = 3          # 'fall': Consecutive failures to mark DOWN
+rise           = 2          # 'rise': Consecutive successes to mark UP
+timeout        = 3.0        # Health check & backend connection timeout (seconds)

@@ -5,15 +5,15 @@ import os
 import re
 import tempfile
 import gssapi
-import krb5
 import hashlib
 import time
 import traceback
 import unicodedata
 from functools import partial
 from filelock import AsyncUnixFileLock
-from contextlib import closing, suppress
+from contextlib import suppress
 
+from .ccache import get_ticket_endtime
 from .config import (
     KRB5_CLIENT_KTNAME,
     KRB5_PRINCIPAL,
@@ -41,7 +41,6 @@ class KerberosProxy:
 
         os.makedirs(self.ccache_dir, exist_ok=True, mode=0o700)
         self.proxy_creds = None
-        self.krb5_ctx = krb5.init_context()
 
     async def get_proxy_creds(self) -> gssapi.Credentials:
         # Loaded, not expired and valid for > 5 minutes
@@ -88,26 +87,28 @@ class KerberosProxy:
             )
             return self.proxy_creds
 
-    def _krb5_get_creds(self, ccache_path: str, spn: str):
-        if not os.path.exists(ccache_path):
-            return None, None
+    def _krb5_get_creds(self, ccache_path: str, user_name: gssapi.Name, spn: str):
         try:
-            valid = None
-            krb5_ccache = krb5.cc_resolve(self.krb5_ctx, f'FILE:{ccache_path}'.encode())
-            # would leak file handles on break without wrapping the iterator in closing()
-            with closing(iter(krb5_ccache)) as ticket_stream:
-                for krb5_cred in ticket_stream:
-                    server_name = krb5_cred.server.name.decode()
-                    if server_name == spn:
-                        valid = krb5_cred.times.endtime > (time.time() + self.min_lifetime)
-                        break
-            rcreds = gssapi.raw.creds.Creds()
-            gssapi.raw.ext_krb5.krb5_import_cred(rcreds, cache=krb5_ccache.addr)
-            gss_creds = gssapi.Credentials(base=rcreds)
-            return gss_creds, valid
-        except Exception as e:
+            endtime = get_ticket_endtime(ccache_path, spn)
+        except Exception:
             traceback.print_exc()
             return None, None
+
+        if endtime is None:
+            return None, None
+
+        if endtime <= (time.time() + self.min_lifetime):
+            return None, False
+
+        try:
+            gss_creds = gssapi.Credentials(
+                name=user_name,
+                usage='initiate',
+                store={'ccache': f'FILE:{ccache_path}'}
+            )
+            return gss_creds, True
+        except (gssapi.exceptions.GSSError, gssapi.raw.exceptions.ExpiredCredentialsError):
+            return None, False
 
     def _upn_ccache_path(self, upn: str) -> str:
         user, sep, domain = upn.partition('@')
@@ -157,14 +158,14 @@ class KerberosProxy:
 
         # Fast path (lock-free): _store_ccache_atomic guarantees readers only ever
         # see a complete inode, and valid cached tickets require no KDC network I/O.
-        creds, creds_valid = self._krb5_get_creds(ccache_path, spn)
+        creds, creds_valid = self._krb5_get_creds(ccache_path, user_name, spn)
         if creds and creds_valid:
             return init_context(creds)
 
         # Not found in cache (or expired/expiring) -> acquire lock
         async with AsyncUnixFileLock(ccache_path + '.lock'):
             # Double check after acquiring lock
-            creds, creds_valid = self._krb5_get_creds(ccache_path, spn)
+            creds, creds_valid = self._krb5_get_creds(ccache_path, user_name, spn)
             if creds and creds_valid:
                 return init_context(creds)
 

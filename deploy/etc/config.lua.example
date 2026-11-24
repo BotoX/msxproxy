@@ -1,0 +1,60 @@
+-- /etc/msxproxy/config.lua  (chmod 0640, root:<openresty-group>)
+--
+-- OpenResty deployment configuration & secrets.
+-- Loaded automatically via lua_package_path "/etc/msxproxy/?.lua;..."
+
+return {
+    -- Public / backend hostnames (used in Autodiscover JSON responses)
+    hosts = {
+        webmail      = "webmail.uni-graz.at",
+        exchange     = "email.uni-graz.at",
+        autodiscover = "autodiscover.uni-graz.at",
+    },
+
+    -- OIDC / Identity providers
+    oidc = {
+        -- Microsoft Entra ID tenant (for Hybrid Modern Auth Bearer verification)
+        msx_tenant_id = "a7c865db-16d5-4de3-8c05-b1e99d713376",
+
+        -- Local Keycloak realm base URL (no trailing slash)
+        local_issuer = "https://login.uni-graz.at/auth/realms/UniGraz",
+        audience     = "https_webmail.uni-graz.at",
+
+        -- Direct Grant (ROPC) client used for HTTP Basic Auth
+        direct_grant = {
+            client_id     = "https_webmail.uni-graz.at_DirectGrant",
+            client_secret = "CHANGE_ME",
+            timeout       = 5000,
+        },
+
+        -- Browser OWA Authorization Code + PKCE client
+        owa = {
+            client_id      = "https_webmail.uni-graz.at",
+            client_secret  = "CHANGE_ME",
+            redirect_uri   = "/owa/redirect_uri",
+            logout_path    = "/owa/logout",
+            -- Random 32-byte secret for lua-resty-session: openssl rand -hex 32
+            session_secret = "CHANGE_ME",
+        },
+    },
+
+    -- Base64-encoded 32-byte random key for auth_cache HMAC/AES derivation:
+    --   openssl rand -base64 32
+    mac_key_b64 = "CHANGE_ME_BASE64_32_BYTES",
+
+    -- S4U2Api Kerberos impersonation daemon
+    s4u2api = {
+        host    = "127.0.0.1",
+        port    = 7777,
+        spn     = "http",
+        timeout = 5000,
+    },
+
+    -- Per-IP Basic Auth rate limiter (optional overrides)
+    ratelimit = {
+        base_bantime = 60,        -- seconds (1 minute)
+        findtime     = 12 * 3600, -- seconds (12 hours)
+        maxretry     = 15,
+        max_bantime  = 15 * 60,   -- seconds (15 minutes)
+    },
+}

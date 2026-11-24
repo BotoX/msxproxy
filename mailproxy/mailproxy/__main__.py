@@ -1,4 +1,5 @@
 import asyncio
+import os
 import signal
 import socket
 import ssl
@@ -11,6 +12,7 @@ from . import auth, config
 from .imap_proxy import ImapProxyServer
 from .smtp_proxy import SmtpProxyServer
 from .loadbalancer import LoadBalancer
+from .metrics import start_metrics_server
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,19 @@ def _make_tcp_socket(host: str, port: int) -> socket.socket:
     return sock
 
 
-async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> None:
+def _load_certs(ssl_ctx: ssl.SSLContext) -> None:
+    if not config.PROXY_CERTS:
+        raise ValueError("No TLS certificates configured in [proxy].certs")
+    for cert_path, key_path in config.PROXY_CERTS:
+        ssl_ctx.load_cert_chain(cert_path, key_path)
+
+
+async def _serve(
+    socks: tuple[socket.socket, ...],
+    ssl_ctx: ssl.SSLContext,
+    metrics_host: str = "127.0.0.1",
+    metrics_port: int | None = None,
+) -> None:
     loop = asyncio.get_running_loop()
     imap_sock, imaps_sock, smtp_sock, smtps_sock = socks
 
@@ -41,6 +55,11 @@ async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> N
     imaps_srv = await asyncio.start_server(imap_proxy.handle_client, sock=imaps_sock, ssl=ssl_ctx)
     smtp_srv  = await asyncio.start_server(smtp_proxy.handle_client, sock=smtp_sock)
     smtps_srv = await asyncio.start_server(smtp_proxy.handle_client, sock=smtps_sock, ssl=ssl_ctx)
+    metrics_srv = (
+        await start_metrics_server(metrics_host, metrics_port, [imap_lb, smtp_lb])
+        if metrics_port
+        else None
+    )
 
     stop_event = asyncio.Event()
 
@@ -49,12 +68,48 @@ async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> N
             logger.info("Shutdown requested.")
             stop_event.set()
 
+    async def _do_hot_reload() -> None:
+        logger.info("SIGHUP received: hot-reloading config, TLS certificates, and OIDC JWKS...")
+        try:
+            config.load_config()
+        except Exception as e:
+            logger.error("Hot reload failed while reading %s: %s (keeping previous config)", config.CONFIG_PATH, e)
+            return
+
+        try:
+            _load_certs(ssl_ctx)
+            logger.info("Reloaded %d TLS certificate chain(s).", len(config.PROXY_CERTS))
+        except Exception as e:
+            logger.error("Hot reload failed to load TLS certs: %s (keeping previous certs)", e)
+
+        try:
+            await loop.run_in_executor(None, auth.oidc.reload_from_config)
+            logger.info("Reloaded OIDC settings and JWKS.")
+        except Exception as e:
+            logger.error("Hot reload failed to refresh OIDC/JWKS: %s (keeping previous JWKS)", e)
+
+        try:
+            await asyncio.gather(
+                imap_lb.reload(config.IMAP_BACKENDS),
+                smtp_lb.reload(config.SMTP_BACKENDS),
+            )
+        except Exception as e:
+            logger.error("Hot reload failed to update backends: %s (keeping previous backends)", e)
+
+    def _request_reload() -> None:
+        asyncio.create_task(_do_hot_reload())
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _request_stop)
+    loop.add_signal_handler(signal.SIGHUP, _request_reload)
 
     # Stop accepting new connections as soon as the stop event fires.
     async with imap_srv, imaps_srv, smtp_srv, smtps_srv:
-        await stop_event.wait()
+        if metrics_srv is not None:
+            async with metrics_srv:
+                await stop_event.wait()
+        else:
+            await stop_event.wait()
 
     # Stop load balancers and shared HTTP client
     await asyncio.gather(
@@ -87,13 +142,20 @@ async def _serve(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> N
     logger.info("All connections closed. Goodbye.")
 
 
-def _worker(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> None:
+def _worker(
+    socks: tuple[socket.socket, ...],
+    ssl_ctx: ssl.SSLContext,
+    metrics_host: str = "127.0.0.1",
+    metrics_port: int | None = None,
+) -> None:
     # Workers must not react to ^C themselves — the parent catches it and
     # sends SIGTERM to each worker, which _serve() handles via its event loop.
+    # Ignore SIGHUP until _serve() registers its async hot-reload handler.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     try:
-        uvloop.run(_serve(socks, ssl_ctx))
+        uvloop.run(_serve(socks, ssl_ctx, metrics_host, metrics_port))
     except Exception:
         logging.exception("Worker crashed")
 
@@ -105,6 +167,10 @@ def _worker(socks: tuple[socket.socket, ...], ssl_ctx: ssl.SSLContext) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="IMAP/SMTP authentication proxy")
     parser.add_argument(
+        "--config", default=None,
+        help=f"Path to mailproxy TOML config (default: {config.CONFIG_PATH})",
+    )
+    parser.add_argument(
         "--log", default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         help="Set the logging level (default: %(default)s)"
@@ -114,12 +180,12 @@ def main() -> None:
         help="Number of worker processes (default: %(default)d)",
     )
     parser.add_argument(
-        "--cert", default=config.PROXY_CERT_FILE,
-        help="TLS certificate for client-facing listeners (default: %(default)s)",
+        "--metrics-host", default="127.0.0.1",
+        help="Bind host for Prometheus /metrics endpoint (default: %(default)s)",
     )
     parser.add_argument(
-        "--key", default=config.PROXY_KEY_FILE,
-        help="TLS private key for client-facing listeners (default: %(default)s)",
+        "--metrics-port", type=int, default=None,
+        help="Bind port for Prometheus /metrics endpoint (disabled if omitted)",
     )
     args = parser.parse_args()
 
@@ -135,10 +201,14 @@ def main() -> None:
         )
         logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    if args.config:
+        config.load_config(args.config, required=True)
+        auth.oidc.reload_from_config()
+
     # Build TLS context once in the parent.  Workers inherit it via fork
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ssl_ctx.load_cert_chain(args.cert, args.key)
+    _load_certs(ssl_ctx)
 
     # Bind all four sockets before forking so every worker shares the same
     # listening file descriptors.
@@ -156,10 +226,23 @@ def main() -> None:
 
     if args.workers > 1:
         processes = []
-        for _ in range(args.workers):
-            p = multiprocessing.Process(target=_worker, args=(socks, ssl_ctx))
+        for idx in range(args.workers):
+            # Only worker 0 serves /metrics (counters are shared via multiprocessing.Value)
+            w_metrics_port = args.metrics_port if idx == 0 else None
+            p = multiprocessing.Process(
+                target=_worker,
+                args=(socks, ssl_ctx, args.metrics_host, w_metrics_port),
+            )
             p.start()
             processes.append(p)
+
+        def _forward_sighup(signum, frame):
+            logger.info("Forwarding SIGHUP to %d worker(s)...", len(processes))
+            for p in processes:
+                if p.is_alive() and p.pid:
+                    os.kill(p.pid, signal.SIGHUP)
+
+        signal.signal(signal.SIGHUP, _forward_sighup)
 
         logger.info("Spawned %d workers (pids: %s).",
                     len(processes), ", ".join(str(p.pid) for p in processes))
@@ -176,7 +259,7 @@ def main() -> None:
 
     else:
         try:
-            uvloop.run(_serve(socks, ssl_ctx))
+            uvloop.run(_serve(socks, ssl_ctx, args.metrics_host, args.metrics_port))
         except KeyboardInterrupt:
             print('\nShutting down.')
 

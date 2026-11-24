@@ -1,0 +1,26 @@
+[Unit]
+Description=S4U2Proxy Python API
+After=network.target valkey-server.service
+Requires=valkey-server.service
+
+[Service]
+Type=simple
+User=s4u2api
+Group=s4u2api
+
+Environment=PYTHONDONTWRITEBYTECODE=1
+LoadCredential=krb5_keytab:/etc/msxproxy/krb5_keytab
+
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=/dev/shm
+
+LimitNOFILE=65535
+WorkingDirectory=/opt/msxproxy/s4u2api
+ExecStart=/usr/bin/python3 -m s4u2api --host 127.0.0.1 --port 7777
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
