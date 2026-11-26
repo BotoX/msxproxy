@@ -46,6 +46,7 @@ The proxy resolves this by owning the internet-facing authentication entirely, i
 | **IMAP/SMTP Proxy** (`localhost:143/993/587/465`) | Python / asyncio | SASL auth (PLAIN, LOGIN, XOAUTH2, OAUTHBEARER); Keycloak ROPC + JWT verify; GSSAPI backend auth; bidirectional relay |
 | **Keycloak** (`login.uni-graz.at`) | Keycloak | OIDC IdP; issues tokens; enforces MFA; manages mail passwords; controls ACR claims |
 | **S4U2Api** (`localhost:7777`) | Custom daemon | Kerberos S4U2Self + S4U2Proxy delegation; service ticket cache in `/dev/shm` |
+| **activesync-enroll** (`localhost:8000`, optional) | Python / FastAPI | ActiveSync DeviceID enrollment fake server (`/Microsoft-Server-ActiveSync` only; zero Keycloak calls) |
 | **KDC** (`pers.ad.uni-graz.at`) | Active Directory | Kerberos Key Distribution Center |
 | **Exchange** (`email.uni-graz.at`) | MS Exchange | On-premises mail server; receives only Kerberos Negotiate, GSSAPI, or Microsoft Bearer tokens |
 | **Microsoft STS** (`login.microsoftonline.com`) | Azure AD / Entra | Issues tokens for Hybrid Modern Authentication clients |
@@ -401,6 +402,8 @@ sequenceDiagram
 | EWS/EAS/MAPI | HTTPS | Any | Bearer — Keycloak JWT | Keycloak JWKS verify → S4U2Proxy | Kerberos Negotiate |
 | EWS/EAS/MAPI | HTTPS | Trusted | Basic — any ACR | OpenResty ROPC → S4U2Proxy | Kerberos Negotiate |
 | EWS/EAS/MAPI | HTTPS | Any | Basic — `acr=mail-password` | OpenResty ROPC → S4U2Proxy | Kerberos Negotiate |
+| EAS | HTTPS | External | Basic — `acr=deviceId` *(optional)* | OpenResty ROPC (`DeviceId`/`DeviceType`) → S4U2Proxy | Kerberos Negotiate |
+| EAS | HTTPS | External | Basic — unenrolled device *(optional)* | OpenResty ROPC → `ngx.exec(@activesync_enroll)` → `activesync-enroll` | _(fake enrollment email)_ |
 | EWS/EAS/MAPI | HTTPS | External | Basic — regular password | OpenResty → 403 Forbidden | _(not forwarded)_ |
 | EWS/EAS/MAPI | HTTPS | Trusted | NTLM / Negotiate | Passthrough | NTLM / Negotiate |
 | Thunderbird | IMAP/SMTP | Any | XOAUTH2 / OAUTHBEARER | Keycloak JWKS verify → S4U2Proxy | Kerberos Negotiate |
@@ -413,7 +416,7 @@ sequenceDiagram
 
 ## Deployment (Ubuntu / Git-Based)
 
-Clone directly into `/opt/msxproxy`, keep all secrets/config outside the repo in `/etc/msxproxy/`, and use [deploy/deploy.sh](deploy/deploy.sh) to link OpenResty, systemd units, and `tmpfiles.d` without copying files:
+Clone directly into `/opt/msxproxy`, keep all secrets/config outside the repo in `/etc/msxproxy/`, and use [deploy/deploy.sh](deploy/deploy.sh) to link OpenResty and systemd units without copying files:
 
 ```bash
 git clone <repo-url> /opt/msxproxy
@@ -440,7 +443,22 @@ sudo systemctl enable --now s4u2api mailproxy openresty
 ### Upgrading, Reloading & Rolling Back
 
 ```bash
-sudo /opt/msxproxy/deploy/deploy.sh reload          # zero-downtime cert/config reload (OpenResty + mailproxy SIGHUP)
+sudo /opt/msxproxy/deploy/deploy.sh reload          # zero-downtime cert/config reload (OpenResty + mailproxy/s4u2api/activesync-enroll SIGHUP)
 sudo /opt/msxproxy/deploy/deploy.sh update          # git pull --ff-only + pytest + nginx -t + reload/restart
 sudo /opt/msxproxy/deploy/deploy.sh update v1.2.0   # deploy or roll back to a specific git tag
 ```
+
+---
+
+## Deployment (Docker Compose)
+
+To run the full `msxproxy` stack in Docker (OpenResty + NTLM module, `s4u2api` + Valkey, `mailproxy`, and optional `activesync-enroll` via Compose profile) with bind-mounted repo code/configs and zero-downtime hot reloading, see [docker/README.md](docker/README.md):
+
+```bash
+./docker/msxproxy.sh init
+./docker/msxproxy.sh check
+./docker/msxproxy.sh up --build                      # core stack (or add --activesync-enroll)
+./docker/msxproxy.sh reload [service...]             # zero-downtime hot reload (all or single service)
+```
+
+For the self-contained end-to-end integration test stack (containerized Keycloak + Mock Exchange), see [docker-ci/README.md](docker-ci/README.md) (`./docker-ci/run-tests.sh`).

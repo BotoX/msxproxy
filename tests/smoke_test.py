@@ -2,35 +2,39 @@
 """
 Live staging / production smoke test suite for msxproxy (Python stdlib only).
 
-Reads endpoints and optional test credentials from environment variables or a
-local gitignored `tests/.env` file. Checks that require credentials are skipped
-cleanly if the corresponding env var is unset.
+Reads endpoints and optional test credentials from `/etc/msxproxy/smoke_test.toml`
+(override with `--config <path>` or `SMOKE_TEST_CONFIG`). Environment variables
+override TOML values if set. Checks that require credentials are skipped cleanly
+if the corresponding fields are blank.
 
 Usage:
-    cp tests/.env.example tests/.env   # fill in staging/test user credentials
-    python3 tests/smoke_test.py
+    sudo python3 tests/smoke_test.py
+    python3 tests/smoke_test.py --config /path/to/smoke_test.toml
 """
+import argparse
 import base64
+import html
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import sys
+import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
+DEFAULT_CONFIG_PATH = "/etc/msxproxy/smoke_test.toml"
 
-def load_dotenv(path: Path) -> None:
+
+def load_toml_config(path: Path) -> dict:
     if not path.is_file():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        return {}
+    with path.open("rb") as f:
+        return tomllib.load(f)
 
 
 def make_ssl_context(verify: bool) -> ssl.SSLContext:
@@ -90,32 +94,82 @@ def read_smtp_reply(rfile) -> bytes:
 
 
 def main() -> int:
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    parser = argparse.ArgumentParser(description="msxproxy live smoke test suite")
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("SMOKE_TEST_CONFIG", DEFAULT_CONFIG_PATH),
+        help=f"Path to smoke_test.toml (default: {DEFAULT_CONFIG_PATH})",
+    )
+    args = parser.parse_args()
 
-    webmail_url = os.environ.get("WEBMAIL_URL", "https://webmail.uni-graz.at").rstrip("/")
-    autodiscover_url = os.environ.get("AUTODISCOVER_URL", "https://autodiscover.uni-graz.at").rstrip("/")
-    mailproxy_host = os.environ.get("MAILPROXY_HOST", "")
-    verify_tls = os.environ.get("VERIFY_TLS", "true").lower() not in ("0", "false", "no")
+    cfg = load_toml_config(Path(args.config))
+    ep = cfg.get("endpoints", {})
+    auth_cfg = cfg.get("auth", {})
+    as_cfg = cfg.get("activesync_enroll", {})
 
-    test_user = os.environ.get("TEST_USER", "")
-    test_mail_pw = os.environ.get("TEST_MAIL_PASSWORD", "")
-    test_regular_pw = os.environ.get("TEST_REGULAR_PASSWORD", "")
-    check_internal = os.environ.get("CHECK_INTERNAL_ENDPOINTS", "false").lower() in ("1", "true", "yes")
+    def _str(env_key: str, section: dict, key: str, default: str = "") -> str:
+        if env_key in os.environ:
+            return os.environ[env_key]
+        val = section.get(key)
+        return str(val) if val is not None else default
 
+    def _bool(env_key: str, section: dict, key: str, default: bool) -> bool:
+        if env_key in os.environ:
+            return os.environ[env_key].lower() in ("1", "true", "yes")
+        val = section.get(key)
+        return bool(val) if val is not None else default
+
+    webmail_url = _str("WEBMAIL_URL", ep, "webmail_url", "https://webmail.uni-graz.at").rstrip("/")
+    autodiscover_url = _str("AUTODISCOVER_URL", ep, "autodiscover_url", "https://autodiscover.uni-graz.at").rstrip("/")
+    mailproxy_host = _str("MAILPROXY_HOST", ep, "mailproxy_host", "")
+    verify_tls = _bool("VERIFY_TLS", ep, "verify_tls", True)
+    check_internal = _bool("CHECK_INTERNAL_ENDPOINTS", ep, "check_internal_endpoints", False)
+
+    test_user = _str("TEST_USER", auth_cfg, "user", "")
+    test_mail_pw = _str("TEST_MAIL_PASSWORD", auth_cfg, "mail_password", "")
+    test_regular_pw = _str("TEST_REGULAR_PASSWORD", auth_cfg, "regular_password", "")
+    as_enroll_enabled = _bool("ACTIVESYNC_ENROLL_ENABLED", as_cfg, "enabled", False)
+    test_preview_secret = _str("TEST_PREVIEW_SECRET", as_cfg, "preview_secret", "")
+    test_unenrolled_dev_id = _str("TEST_UNENROLLED_DEVICE_ID", as_cfg, "unenrolled_device_id", "SMOKETESTUNENROLLED")
+    test_unenrolled_dev_type = _str("TEST_UNENROLLED_DEVICE_TYPE", as_cfg, "unenrolled_device_type", "SmokeTest")
+    test_enrolled_dev_id = _str("TEST_ENROLLED_DEVICE_ID", as_cfg, "enrolled_device_id", "")
+    test_enrolled_dev_type = _str("TEST_ENROLLED_DEVICE_TYPE", as_cfg, "enrolled_device_type", "SmokeTest")
+
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    c_reset  = "\033[0m"   if use_color else ""
+    c_bold   = "\033[1m"   if use_color else ""
+    c_dim    = "\033[2m"   if use_color else ""
+    c_red    = "\033[1;31m" if use_color else ""
+    c_green  = "\033[1;32m" if use_color else ""
+    c_yellow = "\033[1;33m" if use_color else ""
+    c_cyan   = "\033[36m"   if use_color else ""
+
+    passed = 0
+    warnings = 0
+    skipped = 0
     failures = 0
 
     def run_check(name, fn):
-        nonlocal failures
+        nonlocal passed, warnings, skipped, failures
         try:
             msg = fn()
-            print(f"[PASS] {name}" + (f" ({msg})" if msg else ""))
+            passed += 1
+            detail = f" {c_dim}({msg}){c_reset}" if msg else ""
+            print(f"{c_green}[PASS]{c_reset} {name}{detail}")
+        except WarnCheck as w:
+            warnings += 1
+            print(f"{c_yellow}[WARN]{c_reset} {name} {c_dim}({w}){c_reset}")
         except SkipCheck as s:
-            print(f"[SKIP] {name}: {s}")
+            skipped += 1
+            print(f"{c_yellow}[SKIP]{c_reset} {name}: {c_dim}{s}{c_reset}")
         except Exception as e:
             failures += 1
-            print(f"[FAIL] {name}: {e}")
+            print(f"{c_red}[FAIL]{c_reset} {name}: {c_red}{e}{c_reset}")
 
     class SkipCheck(Exception):
+        pass
+
+    class WarnCheck(Exception):
         pass
 
     # 1. Autodiscover JSON
@@ -181,20 +235,113 @@ def main() -> int:
 
     run_check("HTTP Basic Auth with Mail Password -> Exchange", chk_basic_mail_password)
 
-    # 5. Basic Auth external regular password -> 403
+    # 5. Basic Auth external regular password on EWS -> 403
     def chk_basic_regular_password_external():
         if not (test_user and test_regular_pw):
             raise SkipCheck("set TEST_USER and TEST_REGULAR_PASSWORD (run from untrusted network)")
         st, _, body = http_req(
-            f"{webmail_url}/Microsoft-Server-ActiveSync",
+            f"{webmail_url}/EWS/Exchange.asmx",
+            method="GET",
+            headers={"Authorization": basic_header(test_user, test_regular_pw)},
+            verify_tls=verify_tls,
+        )
+        assert st == 403, f"expected 403 for external regular password on EWS, got {st}: {body[:200]}"
+        return "blocked with 403"
+
+    run_check("HTTP Basic Auth external regular password (EWS) -> 403", chk_basic_regular_password_external)
+
+    def fetch_enroll_preview(dev_id: str, dev_type: str) -> tuple[str, str]:
+        """Fetch HTML preview from activesync-enroll and return (preview_url, enroll_url)."""
+        qs = urllib.parse.urlencode({
+            "preview_secret": test_preview_secret,
+            "DeviceId": dev_id,
+            "DeviceType": dev_type,
+        })
+        preview_url = f"{webmail_url}/Microsoft-Server-ActiveSync?{qs}"
+        st, hdrs, body = http_req(
+            preview_url,
+            method="GET",
+            headers={"Authorization": basic_header(test_user, test_regular_pw)},
+            verify_tls=verify_tls,
+        )
+        assert st == 200, f"expected 200 HTML preview from activesync-enroll, got {st}: {body[:200]}"
+        ct = next((v for k, v in hdrs.items() if k.lower() == "content-type"), "")
+        assert "text/html" in ct.lower(), f"expected text/html response, got Content-Type: {ct!r}"
+        marker = next((v for k, v in hdrs.items() if k.lower() == "x-activesync-enroll"), "")
+        assert marker == "preview", f"expected X-ActiveSync-Enroll: preview header, got {marker!r}"
+
+        m = re.search(r'href="(https?://[^"]+enroll_token=[^"]+)"', body)
+        assert m, "rendered HTML preview does not contain an enroll_token link"
+        return preview_url, html.unescape(m.group(1))
+
+    # 5b. ActiveSync DeviceID enrollment checks (enabled vs disabled)
+    def chk_activesync_disabled():
+        if not (test_user and test_regular_pw):
+            raise SkipCheck("set TEST_USER and TEST_REGULAR_PASSWORD (run from untrusted network)")
+        qs = urllib.parse.urlencode({
+            "DeviceId": test_unenrolled_dev_id,
+            "DeviceType": test_unenrolled_dev_type,
+        })
+        st, hdrs, body = http_req(
+            f"{webmail_url}/Microsoft-Server-ActiveSync?{qs}",
             method="OPTIONS",
             headers={"Authorization": basic_header(test_user, test_regular_pw)},
             verify_tls=verify_tls,
         )
-        assert st == 403, f"expected 403 for external regular password, got {st}: {body[:200]}"
-        return "blocked with 403"
+        marker = next((v for k, v in hdrs.items() if k.lower() == "x-activesync-enroll"), "")
+        assert not marker, (
+            f"activesync_enroll.enabled is false in smoke_test.toml, but server routed to "
+            f"activesync-enroll (X-ActiveSync-Enroll: {marker!r})"
+        )
+        assert st == 403, (
+            f"expected 403 for external regular password on ActiveSync when activesync_enroll is disabled, "
+            f"got {st}: {body[:200]}"
+        )
+        return "blocked with 403 (activesync-enroll not active)"
 
-    run_check("HTTP Basic Auth external regular password -> 403", chk_basic_regular_password_external)
+    def chk_activesync_unenrolled_preview():
+        if not (test_user and test_regular_pw and test_preview_secret):
+            raise SkipCheck("set TEST_USER, TEST_REGULAR_PASSWORD, and TEST_PREVIEW_SECRET")
+        preview_url, _ = fetch_enroll_preview(test_unenrolled_dev_id, test_unenrolled_dev_type)
+        print(f"       {c_dim}Browser preview URL:{c_reset}   {c_cyan}{preview_url}{c_reset}")
+        return f"rendered HTML preview for unenrolled DeviceId={test_unenrolled_dev_id}"
+
+    # 5c. ActiveSync DeviceID enrolled -> Exchange (acr=deviceId bypasses activesync-enroll)
+    def chk_activesync_enrolled_device():
+        if not (test_user and test_regular_pw and test_enrolled_dev_id):
+            raise SkipCheck("set TEST_USER, TEST_REGULAR_PASSWORD, and TEST_ENROLLED_DEVICE_ID")
+        qs = urllib.parse.urlencode({
+            "DeviceId": test_enrolled_dev_id,
+            "DeviceType": test_enrolled_dev_type,
+        })
+        st, hdrs, body = http_req(
+            f"{webmail_url}/Microsoft-Server-ActiveSync?{qs}",
+            method="OPTIONS",
+            headers={"Authorization": basic_header(test_user, test_regular_pw)},
+            verify_tls=verify_tls,
+        )
+        marker = next((v for k, v in hdrs.items() if k.lower() == "x-activesync-enroll"), "")
+        if marker:
+            if test_preview_secret:
+                try:
+                    _, enroll_url = fetch_enroll_preview(test_enrolled_dev_id, test_enrolled_dev_type)
+                    print(f"       {c_yellow}Device '{test_enrolled_dev_id}' is not enrolled yet. Enroll it here and re-run:{c_reset}")
+                    print(f"       {c_cyan}{enroll_url}{c_reset}")
+                except Exception as exc:
+                    print(f"       {c_dim}(Could not fetch enroll URL for {test_enrolled_dev_id}: {exc}){c_reset}")
+            raise WarnCheck(
+                f"DeviceId={test_enrolled_dev_id} is not enrolled yet (hit activesync-enroll) — enroll it via the link above and re-run"
+            )
+        assert st == 200, f"expected 200 from Exchange for enrolled DeviceID, got {st}: {body[:200]}"
+        eas = next((v for k, v in hdrs.items() if k.lower() == "ms-server-activesync"), "")
+        assert eas, "missing MS-Server-ActiveSync header from Exchange"
+        return f"Exchange OPTIONS 200 OK (DeviceId={test_enrolled_dev_id}, MS-Server-ActiveSync={eas})"
+
+    if as_enroll_enabled:
+        run_check("ActiveSync unenrolled DeviceID -> activesync-enroll HTML preview", chk_activesync_unenrolled_preview)
+        run_check("ActiveSync enrolled DeviceID (acr=deviceId) -> Exchange", chk_activesync_enrolled_device)
+    else:
+        run_check("ActiveSync regular password (activesync_enroll disabled) -> 403", chk_activesync_disabled)
 
     # 6. Internal /status and /metrics
     def chk_status_and_metrics():
@@ -278,7 +425,13 @@ def main() -> int:
 
     run_check("Mailproxy SMTP (587/465)", chk_smtp)
 
-    print(f"\nSmoke test finished with {failures} failure(s).")
+    summary_counts = f"{passed} passed, {warnings} warnings, {skipped} skipped, {failures} failed"
+    if failures:
+        print(f"\n{c_red}Smoke test failed ({summary_counts}).{c_reset}")
+    elif warnings:
+        print(f"\n{c_yellow}Smoke test finished with warnings ({summary_counts}).{c_reset}")
+    else:
+        print(f"\n{c_green}Smoke test passed ({summary_counts}).{c_reset}")
     return 1 if failures else 0
 
 

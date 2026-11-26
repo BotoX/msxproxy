@@ -14,6 +14,7 @@ from filelock import AsyncUnixFileLock
 from contextlib import suppress
 
 from .ccache import get_ticket_endtime
+from . import config
 from .config import (
     KRB5_CLIENT_KTNAME,
     KRB5_PRINCIPAL,
@@ -41,6 +42,35 @@ class KerberosProxy:
 
         os.makedirs(self.ccache_dir, exist_ok=True, mode=0o700)
         self.proxy_creds = None
+
+    def reload_from_config(self) -> None:
+        """Re-read Kerberos settings from s4u2api.config and clear cached proxy credentials."""
+        new_keytab = config.KRB5_CLIENT_KTNAME
+        new_principal = gssapi.Name(config.KRB5_PRINCIPAL, gssapi.NameType.kerberos_principal)
+        new_ccache_dir = config.KRB5_CCACHE_DIR
+        os.makedirs(new_ccache_dir, exist_ok=True, mode=0o700)
+        self.keytab = new_keytab
+        self.proxy_principal = new_principal
+        self.ccache_dir = new_ccache_dir
+        self.proxy_creds = None
+
+    def prune_ccaches(self, max_age_seconds: int = 86400) -> int:
+        """Remove stale per-user ccache and lock files older than max_age_seconds."""
+        if not os.path.isdir(self.ccache_dir):
+            return 0
+        cutoff = time.time() - max_age_seconds
+        removed = 0
+        with os.scandir(self.ccache_dir) as entries:
+            for entry in entries:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.name in ("_primary", "_primary.lock"):
+                    continue
+                with suppress(OSError):
+                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
+                        removed += 1
+        return removed
 
     async def get_proxy_creds(self) -> gssapi.Credentials:
         # Loaded, not expired and valid for > 5 minutes

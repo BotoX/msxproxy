@@ -1,0 +1,43 @@
+[s4u2api]
+host = "s4u2api"
+port = 7777
+
+[oidc]
+well_known_url = "https://keycloak.localhost:18444/realms/TestRealm/.well-known/openid-configuration"
+audience       = "https_webmail.localhost"
+client_id      = "https_webmail.localhost_DirectGrant"
+client_secret  = "test-direct-grant-secret-0002"
+
+[proxy]
+hostname         = "mailproxy.localhost"
+ehlo             = "mailproxy.localhost"
+auth_timeout     = 30
+trusted_networks = []
+
+[[proxy.certs]]
+cert = "/certs/mailproxy.pem"
+key  = "/certs/mailproxy.key"
+
+[imap]
+listen_host = "0.0.0.0"
+listen_port = 143
+imaps_host  = "0.0.0.0"
+imaps_port  = 993
+backends    = [
+    { host = "exchange.test.local", port = 993, tls = true },
+]
+
+[smtp]
+listen_host = "0.0.0.0"
+listen_port = 587
+smtps_host  = "0.0.0.0"
+smtps_port  = 465
+backends    = [
+    { host = "exchange.test.local", port = 587, tls = false },
+]
+
+[loadbalancer]
+check_interval = 2.0
+fall           = 3
+rise           = 1
+timeout        = 2.0

@@ -242,7 +242,14 @@ def main() -> None:
                 if p.is_alive() and p.pid:
                     os.kill(p.pid, signal.SIGHUP)
 
+        def _forward_sigterm(signum, frame):
+            logger.info("SIGTERM received: shutting down %d worker(s)...", len(processes))
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+
         signal.signal(signal.SIGHUP, _forward_sighup)
+        signal.signal(signal.SIGTERM, _forward_sigterm)
 
         logger.info("Spawned %d workers (pids: %s).",
                     len(processes), ", ".join(str(p.pid) for p in processes))

@@ -17,7 +17,8 @@ ReadWritePaths=/dev/shm
 
 LimitNOFILE=65535
 WorkingDirectory=/opt/msxproxy/s4u2api
-ExecStart=/usr/bin/python3 -m s4u2api --host 127.0.0.1 --port 7777
+ExecStart=/usr/bin/python3 -m s4u2api
+ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always
 RestartSec=5

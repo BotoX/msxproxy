@@ -1,52 +1,50 @@
 # S4U2Api
 
-Use [ktutil](https://web.mit.edu/kerberos/krb5-1.12/doc/admin/admin_commands/ktutil.html) to create the keytab file.
+Specialized Kerberos S4U2Self / S4U2Proxy impersonation daemon bridging modern OpenID Connect (OIDC) JWTs from **Keycloak** into Kerberos service tickets for Microsoft Exchange (HTTP, IMAP, and SMTP).
+
+---
 
 ## Overview
 
 ```mermaid
 graph TD
-    A[OpenResty] -->|JWT over TCP/UDS| B(S4U2Api Master Process)
-    B -->|Distributes| C[S4U2Api Worker]
-    C <-->|1. Check JWT Cache| E[(Valkey/Redis in RAM)]
-    C <-->|1a. Verify JWT| D[pyjwt with keys from<br>Keycloak OIDC]
-    C <-->|2. Check Ticket Cache| G[(KRB5 CCache in /dev/shm)]
-    C <-->|2a. S4U2Proxy Delegation| F[Active Directory KDC]
-    C -->|3. Return Base64 Token| A
+    A["OpenResty / Mailproxy"] -->|"Netstrings (SPN, UPN, JWT)<br/>over TCP or UDS"| B("S4U2Api Master Process")
+    B -->|Distributes| C["S4U2Api Worker"]
+    C <-->|"1. Check JWT Cache"| E[("Valkey in RAM<br/>(/dev/shm/valkey.sock)")]
+    C <-->|"1a. Verify JWT"| D["PyJWT with keys from<br/>Keycloak OIDC JWKS"]
+    C <-->|"2. Check Ticket Cache"| G[("KRB5 CCache in /dev/shm<br/>(atomic temp-file writes)")]
+    C <-->|"2a. S4U2Self + S4U2Proxy"| F["Active Directory KDC"]
+    C -->|"3. Return Base64 Token<br/>(+ optional GSSAPI ctx)"| A
 ```
 
 ### Executive Summary
 
-S4U2Api is a specialized middleware service acting as a bridge between modern OpenID Connect (OIDC) authentication and legacy Kerberos infrastructure.  
-It is explicitly designed to translate Keycloak JWTs into Kerberos Service Tickets for Microsoft Exchange components like HTTP, IMAP, and SMTP.
+S4U2Api translates verified Keycloak JWTs into Kerberos Service Tickets via Active Directory **Constrained Delegation (S4U2Self + S4U2Proxy)**.
 
-The project leverages the Kerberos S4U2Proxy (Constrained Delegation) extension.  
-When a user authenticates via OIDC, this API takes the provided JWT, cryptographically verifies it, and instructs the Kerberos Key Distribution Center (KDC) to issue a ticket on behalf of that user to the target service.
+- **Asyncio + ThreadPool bridge:** Uses `asyncio` + `uvloop` for high-concurrency netstrings framing while offloading blocking C-level GSSAPI / KDC operations to thread pools.
+- **Stampede-resistant JWT cache:** Verified JWTs are cached in RAM-only **Valkey** with per-process HMAC-SHA256 integrity signatures and Redis `SET NX` + Pub/Sub leader/follower coordination so concurrent requests for the same token verify it once.
+- **Lock-free fast path for Kerberos tickets:** Per-user tickets are stored in `/dev/shm` using atomic write-and-rename (`os.replace`), allowing lock-free reads via a pure-Python MIT KRB5 ccache parser (`ccache.py`) while serializing KDC renewals per UPN with `AsyncUnixFileLock`.
 
-The architecture bridges modern asynchronous Python (asyncio) with synchronous, C-based Kerberos and GSSAPI libraries by offloading blocking network/crypto operations to thread pools.  
-It implements an aggressive on-disk caching layer using the RAM-backed /dev/shm filesystem and file-based locking to prevent "thundering herd" scenarios against the Active Directory Key Distribution Center (KDC).
-
-Overall, the codebase utilizes modern asynchronous Python (asyncio, uvloop) and an efficient caching mechanism to handle high loads.
-
+---
 
 ## Worker Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    participant C as OpenResty
+    participant C as OpenResty / Mailproxy
     participant L as S4U2Api Worker
     participant V as Valkey Cache
     participant K as Kerberos Proxy
 
-    C->>L: Request (SPN, UPN, JWT)
+    C->>L: Request (SPN, UPN, JWT, [ctx])
     L->>V: GET jwt:{hash}
 
     alt Cache Miss
         L->>V: SETNX lock:{hash}
         alt Acquired Lock (Leader Worker)
-            L->>L: Verify JWT Signature & Claims<br>with Keycloak keys
-            Note over L: User Principal from JWT claims
-            L->>L: HMAC Sign Cache Payload (User Principal)
+            L->>L: Verify JWT Signature & Claims<br/>with Keycloak JWKS
+            Note over L: Extract krb5_principal from JWT claims
+            L->>L: HMAC Sign Cache Payload (principal:jwt_hash)
             L->>V: Pipeline: SET cache + PUBLISH "READY"
         else Lock Denied (Follower Worker)
             L->>V: SUBSCRIBE pub:{hash}
@@ -58,51 +56,50 @@ sequenceDiagram
         L->>L: Verify HMAC Signature
     end
 
-    L->>K: kerb_proxy.create_context(UPN, SPN)
-    K-->>L: Kerberos Service Ticket
-    L-->>C: Base64 Encoded Token
+    L->>L: Verify requested UPN == JWT krb5_principal
+    L->>K: kerb_proxy.create_context(UPN, full_SPN)
+    K-->>L: Kerberos Service Ticket (+ optional GSSAPI ctx)
+    L-->>C: Base64 Token (+ exported ctx if requested)
 ```
+
+---
 
 ## Kerberos Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    participant EventLoop as Kerberos Proxy<br>Asyncio Event Loop
+    participant EventLoop as Kerberos Proxy<br/>Asyncio Event Loop
     participant Executor as ThreadPool Executor
-    participant UCache as User CCache<br>/dev/shm
-    participant PCache as Primary CCache<br>/dev/shm
+    participant UCache as User CCache<br/>/dev/shm
+    participant PCache as Primary CCache<br/>/dev/shm
     participant KDC as Active Directory KDC
 
     EventLoop->>EventLoop: create_context(upn, spn)
 
-    Note over EventLoop, UCache: 1. Try Fast Path (No Locking)
-    EventLoop->>UCache: user_creds = _krb5_get_creds(ccache_path, spn)
+    Note over EventLoop, UCache: 1. Fast Path (Lock-Free Read)
+    EventLoop->>UCache: _krb5_get_creds(ccache_path, spn)
 
     alt User Creds found & valid > 5m
         EventLoop->>EventLoop: token, ctx = init_context(user_creds)
-        Note over EventLoop, UCache: RETURN Token from User CCache
-
-    else User Creds missing or expired
-        Note over EventLoop, KDC: 2. The Heavy Path (Locking)
+        Note over EventLoop, UCache: Return token from user ccache
+    else User Creds missing or expiring
+        Note over EventLoop, KDC: 2. Heavy Path (Per-UPN File Lock)
         EventLoop->>+UCache: Acquire AsyncUnixFileLock(user.lock)
+        EventLoop->>UCache: Double-check _krb5_get_creds(ccache_path, spn)
 
-        EventLoop->>UCache: user_creds = _krb5_get_creds(ccache_path, spn)
-
-        alt User Creds found & valid > 5m<br>(Another worker got the lock first)
+        alt Another worker refreshed it first
             EventLoop->>EventLoop: token, ctx = init_context(user_creds)
             UCache->>EventLoop: Release AsyncUnixFileLock(user.lock)
-            Note over EventLoop, UCache: RETURN Token from User CCache
-
-        else User Creds still missing or expired after acquiring lock
+        else Still missing or expired
             EventLoop->>EventLoop: proxy_creds = get_proxy_creds()
             alt Proxy Creds expired
-                Note over EventLoop, PCache: 3. Master Proxy Credential Locking
+                Note over EventLoop, PCache: 3. Master Proxy Credential Lock
                 EventLoop->>+PCache: Acquire AsyncUnixFileLock(_primary.lock)
-                EventLoop->>PCache: try: gssapi.Credentials(_primary)
+                EventLoop->>PCache: try gssapi.Credentials(_primary)
                 alt Proxy creds still expired
-                    EventLoop->>PCache: delete _primary
-                    EventLoop->>+Executor: run_in_executor(gssapi.Credentials(_primary))
-                    Executor->>+KDC: Get Master TGT
+                    EventLoop->>PCache: Remove stale _primary
+                    EventLoop->>+Executor: run_in_executor(gssapi.Credentials)
+                    Executor->>+KDC: Get Master TGT (using keytab)
                     KDC-->>-Executor: Master TGT
                     Executor->>PCache: Write _primary ccache
                     Executor-->>-EventLoop: proxy_creds
@@ -111,93 +108,70 @@ sequenceDiagram
                 PCache->>-EventLoop: Release AsyncUnixFileLock(_primary.lock)
             end
 
-            Note over EventLoop, KDC: 4. Impersonation (S4U2Proxy)
+            Note over EventLoop, KDC: 4. S4U2Self Impersonation
             EventLoop->>+Executor: run_in_executor(proxy_creds.impersonate)
-            Executor->>+KDC: Get User Ticket
+            Executor->>+KDC: Get User Ticket (S4U2Self)
             KDC-->>-Executor: User Ticket
             Executor-->>-EventLoop: user_creds
+
+            Note over EventLoop, KDC: 5. S4U2Proxy Service Ticket
+            EventLoop->>+Executor: run_in_executor(init_context(user_creds))
+            Executor->>+KDC: Get Service Ticket (S4U2Proxy)
+            KDC-->>-Executor: Service Ticket
+            Executor-->>-EventLoop: Token, gssapi.SecurityContext
+            EventLoop->>UCache: Atomic write (_store_ccache_atomic)
+            UCache->>-EventLoop: Release AsyncUnixFileLock(user.lock)
         end
-
-        EventLoop->>+Executor: run_in_executor(init_context(user_creds))
-        Executor->>+KDC: Get Service Ticket
-        KDC-->>-Executor: Service Ticket
-        Executor-->>-EventLoop: Token, gssapi.SecurityContext
-        EventLoop->>UCache: Write user ccache
-
-        UCache->>-EventLoop: Release AsyncUnixFileLock(user.lock)
-
-        Note over EventLoop, KDC: RETURN Token from KDC
-
     end
 ```
 
+---
 
-## Dependencies
+## Wire Protocol (`aionetstrings`)
 
-```
-apt install valkey-server
-useradd -r -m -d /opt/s4u2api -s /usr/sbin/nologin -K UMASK=0077 s4u2api
-usermod -aG valkey s4u2api
-```
+Clients communicate over a persistent TCP or Unix Domain Socket connection using typed netstring dictionaries:
 
-`/etc/valkey/valkey.conf`
-```
-# valkey.conf
+- **Initial request:** `{"spn": "http", "upn": "user@REALM", "jwt": "<keycloak_jwt>", "ctx": false}`
+  - `spn` must match a short name configured under `[valid_spns]`.
+  - `ctx: true` (used by `mailproxy`) keeps the `gssapi.SecurityContext` open on the connection for multi-round `{"step": "<base64>"}` exchanges and returns the exported context bytes once `complete` is `true`.
+- **Response:** `{"token": "<base64>", "complete": true}` (plus `"ctx": <bytes>` when requested), or `{"error": "<message>"}` on failure.
 
-port 0
-unixsocket /dev/shm/valkey.sock
-unixsocketperm 660
+---
 
-# Disable all disk persistence for the JWT cache
-save ""
-appendonly no
+## Configuration & Hot Reload
 
-maxmemory 64mb
-maxmemory-policy allkeys-lru
+Configuration lives in `/etc/msxproxy/s4u2api.toml` (template: [`../deploy/etc/s4u2api.toml.example`](../deploy/etc/s4u2api.toml.example)), overridable via `S4U2API_CONFIG`. Under systemd, `LoadCredential=krb5_keytab:...` automatically takes precedence over `[kerberos].keytab`.
 
-loglevel notice
-```
+Sending `SIGHUP` (`systemctl reload s4u2api` or `./docker/msxproxy.sh reload s4u2api`) **hot-reloads without restarting**:
+- `[valid_spns]` mapping
+- `[oidc]` discovery metadata and Keycloak JWKS (atomic swap; preserves previous JWKS on error)
+- `[kerberos]` principal, `ccache_dir`, and rotated `krb5_keytab` (clears cached `proxy_creds`)
+- Flushes the Valkey JWT cache so stale entries do not linger
 
-```
-apt install python3-uvloop python3-gssapi python3-jwt python3-httpx python3-redis python3-filelock krb5-user
-```
+---
 
-## SystemD Service
+## CLI Options
 
-`/etc/systemd/system/s4u2api.service`
-```
-[Unit]
-Description=S4U2Proxy Python API
-After=network.target valkey-server.service
-Requires=valkey-server.service
-
-[Service]
-Type=simple
-User=s4u2api
-Group=s4u2api
-
-LoadCredential=krb5_keytab:/root/_msxproxy.keytab
-
-ProtectSystem=strict
-PrivateTmp=yes
-ReadWritePaths=/dev/shm
-
-LimitNOFILE=65535
-WorkingDirectory=/opt/s4u2api
-ExecStart=/usr/bin/python3 -m s4u2api --host 127.0.0.1 --port 7777
-
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
+```bash
+python3 -m s4u2api --host 127.0.0.1 --port 7777 --workers 1 --log INFO
 ```
 
-## CCache Cleanup (`systemd-tmpfiles`)
+| Flag | Default | Description |
+|---|---|---|
+| `--host` / `--port` | From `s4u2api.toml` (`127.0.0.1:7777`) | TCP listen address and port |
+| `--uds` | From `s4u2api.toml` (`None`) | Unix domain socket path with optional `:octal_mode` suffix (overrides TCP) |
+| `--workers` | `1` | Number of worker processes |
+| `--log` | `INFO` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) |
+| `--cert` / `--key` | *(none)* | Optional TLS certificate & key for remote TCP listeners |
 
-`/etc/tmpfiles.d/s4u2api.conf`
-```
-d /dev/shm/krb5_msxproxy 0700 s4u2api s4u2api 1d
-```
+---
 
-Apply immediately with `systemd-tmpfiles --create /etc/tmpfiles.d/s4u2api.conf`. Files older than 24 hours (`1d`) are pruned automatically by `systemd-tmpfiles-clean.timer`.
+## CCache Cleanup
+
+`s4u2api` automatically creates `ccache_dir` (default `/dev/shm/krb5_msxproxy`, mode `0700`) and runs a background hourly pruning task that removes per-user ccache and lock files older than 24 hours (while keeping `_primary`).
+
+---
+
+## Deployment
+
+See [`../INSTALL.md`](../INSTALL.md) for Ubuntu bare-metal setup (Valkey, keytab creation with `ktutil`, and `deploy/systemd/s4u2api.service`) or [`../docker/README.md`](../docker/README.md) for Docker Compose deployment.

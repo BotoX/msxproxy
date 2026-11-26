@@ -347,3 +347,99 @@ def test_kerberos_get_creds_uses_pure_python_ccache_and_gssapi(tmp_path):
         creds, valid = kp._krb5_get_creds(str(cc_exp), client, spn)
         assert creds is None and valid is False
         mock_creds.assert_not_called()
+
+
+def test_s4u2api_oidc_and_kerberos_hot_reload(tmp_path):
+    import s4u2api.auth as s4u_auth
+    import s4u2api.config as s4u_cfg
+
+    # 1. OIDC reload: swaps config + JWKS atomically on success, preserves previous state on failure
+    mock_resp_wk_1 = MagicMock()
+    mock_resp_wk_1.json.return_value = {
+        "issuer": "https://login.example/realms/r1",
+        "jwks_uri": "https://login.example/jwks1",
+    }
+    mock_resp_jwks_1 = MagicMock()
+    mock_resp_jwks_1.json.return_value = {"keys": [{"kty": "oct", "kid": "k1", "k": "c2VjcmV0"}]}
+    client_1 = MagicMock()
+    client_1.__enter__.return_value = client_1
+    client_1.get.side_effect = [mock_resp_wk_1, mock_resp_jwks_1]
+
+    with patch("httpx.Client", return_value=client_1):
+        oidc = s4u_auth.KeycloakOIDCClient("https://login.example/wk1", "aud1")
+    assert oidc.issuer == "https://login.example/realms/r1"
+    assert oidc.audience == "aud1"
+
+    orig_url, orig_aud = s4u_cfg.OIDC_WELL_KNOWN_URL, s4u_cfg.OIDC_AUDIENCE
+    try:
+        s4u_cfg.OIDC_WELL_KNOWN_URL = "https://login.example/wk2"
+        s4u_cfg.OIDC_AUDIENCE = "aud2"
+
+        mock_resp_wk_2 = MagicMock()
+        mock_resp_wk_2.json.return_value = {
+            "issuer": "https://login.example/realms/r2",
+            "jwks_uri": "https://login.example/jwks2",
+        }
+        mock_resp_jwks_2 = MagicMock()
+        mock_resp_jwks_2.json.return_value = {"keys": [{"kty": "oct", "kid": "k2", "k": "c2VjcmV0"}]}
+        client_2 = MagicMock()
+        client_2.__enter__.return_value = client_2
+        client_2.get.side_effect = [mock_resp_wk_2, mock_resp_jwks_2]
+
+        with patch("httpx.Client", return_value=client_2):
+            oidc.reload_from_config()
+        assert oidc.issuer == "https://login.example/realms/r2"
+        assert oidc.audience == "aud2"
+
+        # Failure during reload preserves the previous valid issuer/audience/JWKS
+        s4u_cfg.OIDC_WELL_KNOWN_URL = "https://login.example/broken"
+        s4u_cfg.OIDC_AUDIENCE = "aud3"
+        failing_client = MagicMock()
+        failing_client.__enter__.return_value = failing_client
+        failing_client.get.side_effect = RuntimeError("connection refused")
+        with patch("httpx.Client", return_value=failing_client):
+            with pytest.raises(RuntimeError, match="connection refused"):
+                oidc.reload_from_config()
+        assert oidc.issuer == "https://login.example/realms/r2"
+        assert oidc.audience == "aud2"
+    finally:
+        s4u_cfg.OIDC_WELL_KNOWN_URL = orig_url
+        s4u_cfg.OIDC_AUDIENCE = orig_aud
+
+    # 2. KerberosProxy reload_from_config clears cached proxy_creds & updates keytab/ccache_dir
+    dir1 = tmp_path / "cc1"
+    dir2 = tmp_path / "cc2"
+    kp = kerberos.KerberosProxy("FILE:/tmp/kt1", "svc1@EXAMPLE.COM", str(dir1))
+    kp.proxy_creds = "CACHED_CREDS"
+
+    orig_kt, orig_princ, orig_cc = s4u_cfg.KRB5_CLIENT_KTNAME, s4u_cfg.KRB5_PRINCIPAL, s4u_cfg.KRB5_CCACHE_DIR
+    try:
+        s4u_cfg.KRB5_CLIENT_KTNAME = "FILE:/tmp/kt2"
+        s4u_cfg.KRB5_PRINCIPAL = "svc2@EXAMPLE.COM"
+        s4u_cfg.KRB5_CCACHE_DIR = str(dir2)
+        kp.reload_from_config()
+        assert kp.keytab == "FILE:/tmp/kt2"
+        assert kp.ccache_dir == str(dir2)
+        assert kp.proxy_creds is None
+        assert dir2.is_dir()
+    finally:
+        s4u_cfg.KRB5_CLIENT_KTNAME = orig_kt
+        s4u_cfg.KRB5_PRINCIPAL = orig_princ
+        s4u_cfg.KRB5_CCACHE_DIR = orig_cc
+
+    # 3. KerberosProxy.prune_ccaches removes expired user ccaches, preserves fresh & _primary
+    import time as _time
+    old_user = dir2 / "EX_alice_12345678"
+    fresh_user = dir2 / "EX_bob_87654321"
+    primary = dir2 / "_primary"
+    for p in (old_user, fresh_user, primary):
+        p.write_bytes(b"data")
+    old_mtime = _time.time() - 90000
+    os.utime(old_user, (old_mtime, old_mtime))
+    os.utime(primary, (old_mtime, old_mtime))
+
+    removed = kp.prune_ccaches(max_age_seconds=86400)
+    assert removed == 1
+    assert not old_user.exists()
+    assert fresh_user.exists()
+    assert primary.exists()

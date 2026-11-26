@@ -1,0 +1,30 @@
+# /etc/msxproxy/smoke_test.toml  (chmod 0600, root:root)
+#
+# Configuration for live staging / production smoke tests (`python3 tests/smoke_test.py`).
+# Checks whose credentials or optional fields are left blank are skipped automatically.
+
+[endpoints]
+webmail_url              = "https://webmail.uni-graz.at"
+autodiscover_url         = "https://autodiscover.uni-graz.at"
+mailproxy_host           = "mailproxy.uni-graz.at"
+verify_tls               = true
+# Set to true when running from an IP allowed to scrape /status and /metrics
+check_internal_endpoints = false
+
+[auth]
+# Dedicated staging/service test mailbox credentials (leave empty to skip auth checks)
+user             = ""
+mail_password    = ""
+# Optional: regular AD password to verify untrusted-network 403 enforcement & DeviceID flows
+regular_password = ""
+
+[activesync_enroll]
+# Optional: ActiveSync DeviceID enrollment smoke tests (requires activesync_enroll.enabled = true in config.lua)
+enabled                = false
+# Must match server.preview_secret in /etc/msxproxy/activesync-enroll.toml
+preview_secret         = ""
+unenrolled_device_id   = "SMOKETESTUNENROLLED"
+unenrolled_device_type = "SmokeTest"
+# Enroll this DeviceID via the link printed by smoke_test.py on first run, then re-run:
+enrolled_device_id     = "SMOKETESTENROLLED"
+enrolled_device_type   = "SmokeTest"

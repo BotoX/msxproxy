@@ -1,0 +1,18 @@
+[server]
+host = "0.0.0.0"
+port = 7777
+
+[oidc]
+well_known_url = "https://keycloak.localhost:18444/realms/TestRealm/.well-known/openid-configuration"
+audience       = "https_webmail.localhost"
+
+[valkey]
+socket = "/run/valkey/valkey.sock"
+
+[kerberos]
+principal  = "_msxproxy@TEST.LOCAL"
+ccache_dir = "/tmp/krb5_msxproxy"
+keytab     = "FILE:/tmp/unused_keytab"
+
+[valid_spns]
+http = "http/exchange.test.local@TEST.LOCAL"

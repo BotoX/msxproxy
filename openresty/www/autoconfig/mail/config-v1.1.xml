@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<clientConfig version="1.1">
+  <emailProvider id="uni-graz.at">
+    <domain>uni-graz.at</domain>
+    <displayName>Webmail Uni Graz</displayName>
+    <displayShortName>uni-graz.at</displayShortName>
+    <documentation url="https://it.uni-graz.at">
+      <descr>Documentation description</descr>
+    </documentation>
+    <enable visiturl="https://login.uni-graz.at/auth/realms/UniGraz/account/account-security/signing-in">
+      <instruction>External access requires using a Mail Password. Generate one at https://login.uni-graz.at</instruction>
+      <instruction lang="de">Für den externen Zugriff ist ein E-Mail-Passwort erforderlich. Generieren Sie eines unter https://login.uni-graz.at</instruction>
+    </enable>
+    <incomingServer type="imap">
+      <hostname>mailproxy.uni-graz.at</hostname>
+      <port>993</port>
+      <socketType>SSL</socketType>
+      <authentication>OAuth2</authentication>
+      <authentication>password-cleartext</authentication>
+      <username>%EMAILADDRESS%</username>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>mailproxy.uni-graz.at</hostname>
+      <port>465</port>
+      <socketType>SSL</socketType>
+      <authentication>OAuth2</authentication>
+      <authentication>password-cleartext</authentication>
+      <username>%EMAILADDRESS%</username>
+    </outgoingServer>
+    <incomingServer type="imap">
+      <hostname>mailproxy.uni-graz.at</hostname>
+      <port>143</port>
+      <socketType>STARTTLS</socketType>
+      <authentication>OAuth2</authentication>
+      <authentication>password-cleartext</authentication>
+      <username>%EMAILADDRESS%</username>
+    </incomingServer>
+    <outgoingServer type="smtp">
+      <hostname>mailproxy.uni-graz.at</hostname>
+      <port>587</port>
+      <socketType>STARTTLS</socketType>
+      <authentication>OAuth2</authentication>
+      <authentication>password-cleartext</authentication>
+      <username>%EMAILADDRESS%</username>
+    </outgoingServer>
+    <incomingServer type="exchange">
+      <hostname>webmail.uni-graz.at</hostname>
+      <port>443</port>
+      <username>%EMAILADDRESS%</username>
+      <socketType>SSL</socketType>
+      <authentication>OAuth2</authentication>
+      <authentication>password-cleartext</authentication>
+      <owaURL>https://webmail.uni-graz.at/owa/</owaURL>
+      <ewsURL>https://webmail.uni-graz.at/EWS/Exchange.asmx</ewsURL>
+      <easURL>https://webmail.uni-graz.at/Microsoft-Server-ActiveSync</easURL>
+      <useGlobalPreferredServer>false</useGlobalPreferredServer>
+    </incomingServer>
+    <incomingServer type="ews">
+      <hostname>webmail.uni-graz.at</hostname>
+      <port>443</port>
+      <url>https://webmail.uni-graz.at/EWS/Exchange.asmx</url>
+      <username>%EMAILADDRESS%</username>
+      <socketType>SSL</socketType>
+      <authentication>OAuth2</authentication>
+      <authentication>password-cleartext</authentication>
+    </incomingServer>
+  </emailProvider>
+  <oAuth2>
+    <issuer>login.uni-graz.at</issuer>
+    <scope>openid offline_access</scope>
+    <authURL>https://login.uni-graz.at/auth/realms/UniGraz/protocol/openid-connect/auth</authURL>
+    <tokenURL>https://login.uni-graz.at/auth/realms/UniGraz/protocol/openid-connect/token</tokenURL>
+    <clientID>thunderbird</clientID>
+  </oAuth2>
+  <webMail>
+    <loginPage url="https://webmail.uni-graz.at/owa/"/>
+    <loginPageInfo url="https://login.uni-graz.at/auth/realms/UniGraz/protocol/openid-connect/auth">
+      <username>%EMAILADDRESS%</username>
+      <usernameField id="username"/>
+      <passwordField id="password"/>
+      <loginButton id="kc-login"/>
+    </loginPageInfo>
+  </webMail>
+</clientConfig>

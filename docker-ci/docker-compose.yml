@@ -1,0 +1,256 @@
+services:
+  certs:
+    image: alpine:3.21
+    command: ["sh", "-c", "apk add --no-cache openssl >/dev/null && sh /generate-certs.sh"]
+    volumes:
+      - ./certs/generate-certs.sh:/generate-certs.sh:ro
+      - certs:/certs
+    restart: "no"
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command:
+      - valkey-server
+      - --port
+      - "0"
+      - --unixsocket
+      - /run/valkey/valkey.sock
+      - --unixsocketperm
+      - "777"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - valkey_sock:/run/valkey
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-s", "/run/valkey/valkey.sock", "PING"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    networks:
+      - msxproxy-net
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    command:
+      - start-dev
+      - --import-realm
+      - --https-certificate-file=/certs/keycloak.pem
+      - --https-certificate-key-file=/certs/keycloak.key
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: https://keycloak.localhost:18444
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HTTPS_PORT: "18444"
+    ports:
+      - "127.0.0.1:18444:18444"
+      - "[::1]:18444:18444"
+    volumes:
+      - certs:/certs:ro
+      - ${KEYCLOAK_MAIL_PASSWORDS_JAR:-../../keycloak-mail-passwords/target/keycloak-mail-passwords-1.0.0.jar}:/opt/keycloak/providers/keycloak-mail-passwords-1.0.0.jar:ro
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /realms/TestRealm/.well-known/openid-configuration HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"issuer\"' <&3"
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+    networks:
+      msxproxy-net:
+        aliases:
+          - keycloak.localhost
+
+  mock-exchange:
+    build:
+      context: ..
+      dockerfile: docker/python/Dockerfile
+      args:
+        INSTALL_TEST_DEPS: "1"
+    image: msxproxy-test-python:local
+    command: ["python3", "/opt/msxproxy/docker-ci/mock-exchange/mock_exchange.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      EXCHANGE_CERT: /certs/exchange.pem
+      EXCHANGE_KEY: /certs/exchange.key
+      EXCHANGE_SPN: http/exchange.test.local@TEST.LOCAL
+      SSL_CERT_FILE: /certs/ca.crt
+    volumes:
+      - ..:/opt/msxproxy:ro
+      - certs:/certs:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--cacert", "/certs/ca.crt", "https://exchange.test.local/mapi/healthcheck.htm"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    networks:
+      msxproxy-net:
+        aliases:
+          - exchange.test.local
+          - email.uni-graz.at
+          - ex19ms01.uni-graz.at
+          - ex19ms02.uni-graz.at
+          - ex19ms03.uni-graz.at
+          - ex19ms04.uni-graz.at
+
+  s4u2api:
+    image: msxproxy-test-python:local
+    command: ["python3", "/opt/msxproxy/docker-ci/s4u2api/mock_s4u2api.py", "--log", "INFO"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      S4U2API_CONFIG: /etc/msxproxy/s4u2api.toml
+      SSL_CERT_FILE: /certs/ca.crt
+    volumes:
+      - ..:/opt/msxproxy:ro
+      - certs:/certs:ro
+      - valkey_sock:/run/valkey
+      - ./s4u2api/s4u2api.toml:/etc/msxproxy/s4u2api.toml:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 7777), 2); s.close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    networks:
+      - msxproxy-net
+
+  activesync-enroll:
+    image: msxproxy-test-python:local
+    working_dir: /opt/msxproxy/activesync-enroll
+    command: ["python3", "-m", "activesync_enroll"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      ACTIVESYNC_ENROLL_CONFIG: /etc/msxproxy/activesync-enroll.toml
+      SSL_CERT_FILE: /certs/ca.crt
+    volumes:
+      - ..:/opt/msxproxy:ro
+      - ./activesync-enroll/activesync-enroll.toml:/etc/msxproxy/activesync-enroll.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    networks:
+      - msxproxy-net
+
+  openresty:
+    build:
+      context: ${NTLM_MODULE_DIR:-../../ngx_http_upstream_ntlm_module}
+      dockerfile: ../msxproxy/docker-ci/openresty/Dockerfile
+    image: msxproxy-test-openresty:local
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    ports:
+      - "127.0.0.1:18443:18443"
+      - "[::1]:18443:18443"
+    volumes:
+      - certs:/certs:ro
+      - ./openresty/entrypoint.sh:/entrypoint.sh:ro
+      - ./openresty/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./openresty/config.lua:/etc/msxproxy/config.lua:ro
+      - ../deploy/openresty/msxproxy-http.conf:/opt/msxproxy/deploy/openresty/msxproxy-http.conf:ro
+      - ../openresty/conf.d:/opt/msxproxy/openresty/conf.d.src:ro
+      - ../openresty/lua:/opt/msxproxy/openresty/lua:ro
+      - ../openresty/html:/opt/msxproxy/openresty/html:ro
+      - ../openresty/www:/opt/msxproxy/openresty/www:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      s4u2api:
+        condition: service_healthy
+      activesync-enroll:
+        condition: service_healthy
+      mock-exchange:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --cacert /certs/ca.crt https://webmail.localhost:18443/status | grep -q 'UP'"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks:
+      msxproxy-net:
+        aliases:
+          - webmail.localhost
+          - autodiscover.localhost
+
+  mailproxy:
+    image: msxproxy-test-python:local
+    working_dir: /opt/msxproxy/mailproxy
+    command: ["python3", "-m", "mailproxy", "--config", "/etc/msxproxy/mailproxy.toml", "--metrics-host", "0.0.0.0", "--metrics-port", "9101"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      MAILPROXY_CONFIG: /etc/msxproxy/mailproxy.toml
+      SSL_CERT_FILE: /certs/ca.crt
+    ports:
+      - "127.0.0.1:10143:143"
+      - "127.0.0.1:10993:993"
+      - "127.0.0.1:10587:587"
+      - "127.0.0.1:10465:465"
+    volumes:
+      - ..:/opt/msxproxy:ro
+      - certs:/certs:ro
+      - ./mailproxy/mailproxy.toml:/etc/msxproxy/mailproxy.toml:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      s4u2api:
+        condition: service_healthy
+      mock-exchange:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (143, 993, 587, 465)]"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    networks:
+      msxproxy-net:
+        aliases:
+          - mailproxy.localhost
+
+  test-runner:
+    profiles: ["test"]
+    image: msxproxy-test-python:local
+    working_dir: /opt/msxproxy
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SSL_CERT_FILE: /certs/ca.crt
+      SMOKE_TEST_CONFIG: /etc/msxproxy/smoke_test.toml
+      MSXPROXY_INTEGRATION: "1"
+    volumes:
+      - ..:/opt/msxproxy:ro
+      - certs:/certs:ro
+      - ./test-runner/smoke_test.toml:/etc/msxproxy/smoke_test.toml:ro
+    depends_on:
+      openresty:
+        condition: service_healthy
+      mailproxy:
+        condition: service_healthy
+    networks:
+      - msxproxy-net
+
+volumes:
+  certs:
+  valkey_sock:
+
+networks:
+  msxproxy-net:
+    driver: bridge

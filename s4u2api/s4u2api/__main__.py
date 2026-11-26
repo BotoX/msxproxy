@@ -12,9 +12,14 @@ import pathlib
 import traceback
 
 from . import aionetstrings
+from . import auth
+from . import config
+from . import kerberos
 from . import logic
 
 logger = logging.getLogger(__name__)
+
+CCACHE_PRUNE_INTERVAL = 3600
 
 
 async def client_connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -55,19 +60,88 @@ async def client_connected(reader: asyncio.StreamReader, writer: asyncio.StreamW
             await writer.wait_closed()
 
 
-async def run_server(sock, ssl):
-    server = await asyncio.start_server(client_connected, sock=sock, ssl=ssl)
-    async with server:
-        await server.serve_forever()
+async def _ccache_prune_loop(stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=CCACHE_PRUNE_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            pass
+        try:
+            removed = kerberos.kerb_proxy.prune_ccaches()
+            if removed:
+                logger.info("Pruned %d expired Kerberos ccache file(s).", removed)
+        except Exception as e:
+            logger.warning("Failed to prune Kerberos ccaches: %s", e)
 
 
-def worker(sock, ssl):
+async def run_server(sock, ssl_ctx, *, flush_on_start: bool = False):
+    loop = asyncio.get_running_loop()
+    if flush_on_start:
+        await logic.setup()
+
+    server = await asyncio.start_server(client_connected, sock=sock, ssl=ssl_ctx)
+    stop_event = asyncio.Event()
+
+    def _request_stop() -> None:
+        if not stop_event.is_set():
+            logger.info("Shutdown requested.")
+            stop_event.set()
+
+    async def _do_hot_reload() -> None:
+        logger.info("SIGHUP received: hot-reloading s4u2api config, OIDC JWKS, and Kerberos credentials...")
+        try:
+            config.load_config()
+        except Exception as e:
+            logger.error("Hot reload failed while reading %s: %s (keeping previous config)", config.CONFIG_PATH, e)
+            return
+
+        try:
+            await loop.run_in_executor(None, auth.oidc.reload_from_config)
+            logger.info("Reloaded OIDC settings and JWKS.")
+        except Exception as e:
+            logger.error("Hot reload failed to refresh OIDC/JWKS: %s (keeping previous JWKS)", e)
+
+        try:
+            kerberos.kerb_proxy.reload_from_config()
+            logger.info("Reloaded Kerberos principal/keytab settings.")
+        except Exception as e:
+            logger.error("Hot reload failed to update Kerberos settings: %s (keeping previous settings)", e)
+
+        try:
+            await logic.setup()
+            logger.info("Flushed Valkey JWT cache after reload.")
+        except Exception as e:
+            logger.error("Hot reload failed to flush Valkey cache: %s", e)
+
+    def _request_reload() -> None:
+        asyncio.create_task(_do_hot_reload())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _request_stop)
+    if hasattr(signal, "SIGHUP"):
+        loop.add_signal_handler(signal.SIGHUP, _request_reload)
+
+    prune_task = asyncio.create_task(_ccache_prune_loop(stop_event))
+    try:
+        async with server:
+            await stop_event.wait()
+    finally:
+        stop_event.set()
+        prune_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await prune_task
+
+
+def worker(sock, ssl_ctx):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     try:
-        uvloop.run(run_server(sock, ssl))
+        uvloop.run(run_server(sock, ssl_ctx, flush_on_start=False))
     except Exception:
-        pass
+        logging.exception("s4u2api worker crashed")
 
 
 def main():
@@ -82,11 +156,12 @@ def main():
         else:
             return pathlib.Path(s), 0o600
 
+    default_uds = parse_uds(config.SERVER_UDS) if config.SERVER_UDS else None
     parser = argparse.ArgumentParser(description='Kerberos S4U2Proxy API Server')
     parser.register('type', 'uds', parse_uds)
-    parser.add_argument('--uds', type='uds', help='Path to Unix Domain Socket (optional :chmod suffix)')
-    parser.add_argument('--host', default='127.0.0.1', help='TCP Listen Host (default: 127.0.0.1)')
-    parser.add_argument('--port', type=int, default=7777, help='TCP Listen Port (default: 7777)')
+    parser.add_argument('--uds', type='uds', default=default_uds, help='Path to Unix Domain Socket (optional :chmod suffix; overrides host/port)')
+    parser.add_argument('--host', default=config.SERVER_HOST, help='TCP Listen Host (default from config: %(default)s)')
+    parser.add_argument('--port', type=int, default=config.SERVER_PORT, help='TCP Listen Port (default from config: %(default)s)')
     parser.add_argument("--log", default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help="Set the logging level (default: %(default)s)")
     parser.add_argument('--workers', type=int, default=1, help='Number of workers')
     parser.add_argument('--cert', help='Path to SSL certificate (for remote TCP)')
@@ -135,6 +210,22 @@ def main():
             p.start()
             processes.append(p)
 
+        def _forward_sighup(signum, frame):
+            logger.info("Forwarding SIGHUP to %d worker(s)...", len(processes))
+            for p in processes:
+                if p.is_alive() and p.pid:
+                    os.kill(p.pid, signal.SIGHUP)
+
+        def _forward_sigterm(signum, frame):
+            logger.info("Shutting down %d worker(s)...", len(processes))
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _forward_sighup)
+        signal.signal(signal.SIGTERM, _forward_sigterm)
+
         logger.info(f'Spawned {len(processes)} workers.')
 
         try:
@@ -143,14 +234,13 @@ def main():
         except KeyboardInterrupt:
             logger.info('\nShutting down workers...')
             for p in processes:
-                p.terminate()
+                if p.is_alive():
+                    p.terminate()
+            for p in processes:
+                p.join()
     else:
         try:
-            async def single_worker(sock, ssl_ctx):
-                await logic.setup()
-                await run_server(sock, ssl_ctx)
-
-            uvloop.run(single_worker(sock, ssl_ctx))
+            uvloop.run(run_server(sock, ssl_ctx, flush_on_start=True))
         except KeyboardInterrupt:
             logger.info('\nShutting down.')
 

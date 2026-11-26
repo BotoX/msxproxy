@@ -1,12 +1,18 @@
-from datetime import datetime
+from __future__ import annotations
 
-from .utils import get_from_xml, xml_escape
+from datetime import datetime, timezone
+
+from .config import Config, get_config
 from .enroll import generate_enroll_mail
+from .utils import get_from_xml, xml_escape
 
-XML_HEADER = """<?xml version="1.0" encoding="utf-8"?><!DOCTYPE ActiveSync PUBLIC "-//MICROSOFT//DTD ActiveSync//EN" "http://www.microsoft.com/">"""
+XML_HEADER = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<!DOCTYPE ActiveSync PUBLIC "-//MICROSOFT//DTD ActiveSync//EN" "http://www.microsoft.com/">'
+)
 
 
-def OnHTTPOptions() -> dict:
+def OnHTTPOptions() -> dict[str, str]:
     return {
         "MS-Server-ActiveSync": "15.1",
         "MS-ASProtocolVersions": "2.0,2.1,2.5,12.0,12.1,14.0,14.1,16.0,16.1",
@@ -17,7 +23,7 @@ def OnHTTPOptions() -> dict:
             "Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert,Find"
         ),
         "Allow": "OPTIONS,POST",
-        "Public": "OPTIONS,POST"
+        "Public": "OPTIONS,POST",
     }
 
 
@@ -28,19 +34,18 @@ def OnWrongPolicy(cmd: str) -> str:
   <Status>144</Status>
 </Sync>
 """
-    elif cmd == "foldersync":
+    if cmd == "foldersync":
         return XML_HEADER + """
 <FolderSync xmlns="FolderHierarchy:">
   <Status>144</Status>
 </FolderSync>
 """
-    elif cmd == "getitemestimate":
+    if cmd == "getitemestimate":
         return XML_HEADER + """
 <GetItemEstimate xmlns="GetItemEstimate:">
   <Status>144</Status>
 </GetItemEstimate>
 """
-    # Fallback if needed
     return XML_HEADER
 
 
@@ -55,7 +60,7 @@ def OnProvision(xml: str) -> str:
     except Exception:
         policy_status = None
 
-    if policy_key is None or policy_key == 0 and policy_status is None:
+    if policy_key is None or (policy_key == 0 and policy_status is None):
         return XML_HEADER + """
 <Provision xmlns="Provision:">
   <Status>1</Status>
@@ -69,20 +74,6 @@ def OnProvision(xml: str) -> str:
           <DevicePasswordEnabled>0</DevicePasswordEnabled>
         </EASProvisionDoc>
       </Data>
-    </Policy>
-  </Policies>
-</Provision>
-"""
-
-    if policy_key == 0 and policy_status == 1:
-        return XML_HEADER + """
-<Provision xmlns="Provision:">
-  <Status>1</Status>
-  <Policies>
-    <Policy>
-      <PolicyType>MS-EAS-Provisioning-WBXML</PolicyType>
-      <Status>1</Status>
-      <PolicyKey>1337</PolicyKey>
     </Policy>
   </Policies>
 </Provision>
@@ -150,7 +141,7 @@ def OnFolderSync(xml: str) -> str:
   </Changes>
 </FolderSync>
 """
-    elif sync_key == 1337:
+    if sync_key == 1337:
         return XML_HEADER + f"""
 <FolderSync xmlns="FolderHierarchy:">
   <Status>1</Status>
@@ -167,21 +158,19 @@ def OnFolderSync(xml: str) -> str:
 
 def OnGetItemEstimate(xml: str) -> str:
     try:
-        collectionId = get_from_xml("CollectionId", xml) or "inbox"
+        collection_id = get_from_xml("CollectionId", xml) or "inbox"
     except Exception:
-        collectionId = "inbox"
+        collection_id = "inbox"
 
-    if collectionId == "fakeinbox":
-        estimate = 1
-    else:
-        estimate = 0
+    estimate = 1 if collection_id == "fakeinbox" else 0
+    safe_collection_id = xml_escape(collection_id)
 
     return XML_HEADER + f"""
 <GetItemEstimate xmlns="GetItemEstimate:">
   <Response>
     <Status>1</Status>
     <Collection>
-      <CollectionId>{collectionId}</CollectionId>
+      <CollectionId>{safe_collection_id}</CollectionId>
       <Estimate>{estimate}</Estimate>
     </Collection>
   </Response>
@@ -194,31 +183,36 @@ def OnSync(
     subject: str,
     email: str,
     name: str,
-    deviceId: str,
-    deviceType: str,
+    device_id: str,
+    device_type: str,
     protocol_version: str,
     ip: str,
-    ua: str
+    ua: str,
+    config: Config | None = None,
 ) -> str:
+    cfg = config or get_config()
+
     try:
         sync_key = int(get_from_xml("SyncKey", xml))
     except Exception:
         sync_key = 0
 
     try:
-        collectionId = get_from_xml("CollectionId", xml)
+        collection_id = get_from_xml("CollectionId", xml) or "inbox"
     except Exception:
-        collectionId = "inbox"
+        collection_id = "inbox"
+
+    safe_collection_id = xml_escape(collection_id)
 
     # No messages in Drafts/Trash/Sent
-    if collectionId in ("fakedrafts", "faketrash", "fakesent"):
+    if collection_id in ("fakedrafts", "faketrash", "fakesent"):
         return XML_HEADER + f"""
 <Sync xmlns="AirSync:">
   <Collections>
     <Collection>
       <Class>Email</Class>
       <SyncKey>{sync_key if sync_key > 0 else 1}</SyncKey>
-      <CollectionId>{collectionId}</CollectionId>
+      <CollectionId>{safe_collection_id}</CollectionId>
       <Status>1</Status>
       <Commands/>
     </Collection>
@@ -227,21 +221,30 @@ def OnSync(
 """
 
     # Invalid collection
-    if collectionId != "fakeinbox":
+    if collection_id != "fakeinbox":
         return XML_HEADER + """
 <Sync xmlns="AirSync:">
   <Status>12</Status>
 </Sync>
 """
 
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    plain, html = generate_enroll_mail(
-        subject, email, name,
-        deviceId, deviceType,
-        protocol_version, ip, ua
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    plain, html_body = generate_enroll_mail(
+        subject=subject,
+        email=email,
+        name=name,
+        device_id=device_id,
+        device_type=device_type,
+        protocol_version=protocol_version,
+        ip=ip,
+        ua=ua,
+        config=cfg,
     )
-    plain = xml_escape(plain)
-    html = xml_escape(html)
+    plain_xml = xml_escape(plain)
+    html_xml = xml_escape(html_body)
+    safe_email = xml_escape(email)
+    safe_subject = xml_escape(cfg.mail.subject)
+    safe_from = xml_escape(f'"{cfg.mail.from_name}" <{cfg.mail.from_address}>')
 
     if sync_key < 1000:
         return XML_HEADER + f"""
@@ -249,16 +252,16 @@ def OnSync(
   <Collections>
     <Collection>
       <Class>Email</Class>
-      <SyncKey>{sync_key+1}</SyncKey>
-      <CollectionId>{collectionId}</CollectionId>
+      <SyncKey>{sync_key + 1}</SyncKey>
+      <CollectionId>{safe_collection_id}</CollectionId>
       <Status>1</Status>
       <Commands>
         <Add>
           <ServerId>fakemail</ServerId>
           <ApplicationData>
-            <Email:Subject>*** ACTION REQUIRED ***🐰</Email:Subject>
-            <Email:To>{email}</Email:To>
-            <Email:From>"uniIT Exchange ActiveSync MFA🥚" &lt;noreply@uni-graz.at&gt;</Email:From>
+            <Email:Subject>{safe_subject}</Email:Subject>
+            <Email:To>{safe_email}</Email:To>
+            <Email:From>{safe_from}</Email:From>
             <Email:DateReceived>{now}</Email:DateReceived>
             <Email:Read>0</Email:Read>
             <Email:Importance>2</Email:Importance>
@@ -269,10 +272,10 @@ def OnSync(
             <AirSyncBase:Body>
               <AirSyncBase:Type>2</AirSyncBase:Type>
               <AirSyncBase:Truncated>0</AirSyncBase:Truncated>
-              <AirSyncBase:EstimatedDataSize>{len(html)}</AirSyncBase:EstimatedDataSize>
-              <AirSyncBase:Data>{html}</AirSyncBase:Data>
+              <AirSyncBase:EstimatedDataSize>{len(html_body.encode("utf-8"))}</AirSyncBase:EstimatedDataSize>
+              <AirSyncBase:Data>{html_xml}</AirSyncBase:Data>
             </AirSyncBase:Body>
-            <Email:Body>{plain}</Email:Body>
+            <Email:Body>{plain_xml}</Email:Body>
           </ApplicationData>
         </Add>
       </Commands>
@@ -286,7 +289,7 @@ def OnSync(
   <Collections>
     <Collection>
       <SyncKey>{sync_key}</SyncKey>
-      <CollectionId>{collectionId}</CollectionId>
+      <CollectionId>{safe_collection_id}</CollectionId>
       <Status>3</Status>
     </Collection>
   </Collections>

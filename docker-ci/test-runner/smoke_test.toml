@@ -1,0 +1,19 @@
+[endpoints]
+webmail_url              = "https://webmail.localhost:18443"
+autodiscover_url         = "https://autodiscover.localhost:18443"
+mailproxy_host           = "mailproxy.localhost"
+verify_tls               = true
+check_internal_endpoints = true
+
+[auth]
+user             = "testuser"
+mail_password    = "TestMailPass0123456789abcdefghij"
+regular_password = "TestRegularPass123!"
+
+[activesync_enroll]
+enabled                = true
+preview_secret         = "test-preview-secret-0123456789abcdef"
+unenrolled_device_id   = "SMOKETESTUNENROLLED"
+unenrolled_device_type = "SmokeTest"
+enrolled_device_id     = "SMOKETESTENROLLED"
+enrolled_device_type   = "SmokeTest"

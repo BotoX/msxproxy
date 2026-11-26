@@ -112,6 +112,7 @@ package.loaded["cjson.safe"] = {
 
 -- Mock resty.http and resty.openidc for keycloak.lua tests
 local mock_http_res, mock_http_err
+local last_http_req_opts
 local mock_discovery, mock_discovery_err
 local mock_jwt_claims, mock_jwt_err
 
@@ -120,6 +121,7 @@ package.loaded["resty.http"] = {
         return {
             set_timeout = function() end,
             request_uri = function(_, url, opts)
+                last_http_req_opts = opts
                 return mock_http_res, mock_http_err
             end,
         }
@@ -329,6 +331,42 @@ do
     check("keycloak CrowdSec metrics incremented",
         prom:find('msxproxy_crowdsec_blocks_total{type="ban"} 1', 1, true) ~= nil
         and prom:find('msxproxy_crowdsec_blocks_total{type="captcha"} 1', 1, true) ~= nil)
+
+    -- 4h. ActiveSync DeviceID enroll mode: sends DeviceId/DeviceType/profile+email scope
+    mock_http_res = { status = 200, headers = { ["Content-Type"] = "application/json" }, body = ok_body }
+    mock_jwt_claims = {
+        iss = "https://login.example/realms/UniGraz",
+        aud = { "https_webmail.uni-graz.at" },
+        exp = fake_now + 300,
+        krb5_principal = "alice@PERS.AD.UNI-GRAZ.AT",
+        preferred_username = "alice",
+        email = "alice@uni-graz.at",
+        name = "Alice Example",
+        acr = "deviceId",
+    }
+    local res_dev = keycloak.authenticate_basic(cfg, "alice", "pw", "203.0.113.1", false, {
+        activesync_enroll = true,
+        device_id = "APPL999",
+        device_type = "iPhone",
+    })
+    check("keycloak activesync deviceId ACR succeeds with impersonate",
+        res_dev.impersonate ~= nil
+        and last_http_req_opts.body:find("DeviceId=APPL999", 1, true) ~= nil
+        and last_http_req_opts.body:find("DeviceType=iPhone", 1, true) ~= nil
+        and last_http_req_opts.body:find("scope=openid profile email", 1, true) ~= nil)
+
+    -- 4i. ActiveSync DeviceID enroll mode with unenrolled device (no acr) -> returns enroll payload
+    mock_jwt_claims.acr = nil
+    local res_enroll = keycloak.authenticate_basic(cfg, "alice", "pw", "203.0.113.1", false, {
+        activesync_enroll = true,
+        device_id = "NEWDEV",
+        device_type = "Android",
+    })
+    check("keycloak activesync unenrolled device returns enroll payload",
+        res_enroll.enroll ~= nil
+        and res_enroll.enroll.subject == "alice"
+        and res_enroll.enroll.email == "alice@uni-graz.at"
+        and res_enroll.enroll.name == "Alice Example")
 end
 
 print("\nALL " .. passed .. " OPENRESTY LUA TESTS PASSED!")

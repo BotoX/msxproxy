@@ -57,4 +57,12 @@ return {
         maxretry     = 15,
         max_bantime  = 15 * 60,   -- seconds (15 minutes)
     },
+
+    -- Optional: ActiveSync DeviceID enrollment fake server (activesync-enroll)
+    -- Enable only when Keycloak's ActiveSync DeviceID authenticator is active.
+    activesync_enroll = {
+        enabled   = false,
+        -- Short cache TTL (seconds) covering the multi-step fake ActiveSync sync
+        cache_ttl = 10,
+    },
 }

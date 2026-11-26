@@ -89,7 +89,7 @@ PROXY_HOSTNAME = "mailproxy.uni-graz.at"
 AUTH_TIMEOUT = 60
 
 PROXY_CERTS: list[tuple[str, str]] = [
-    ("/etc/msxproxy/mailproxy.pem", "/etc/msxproxy/mailproxy.key"),
+    ("/etc/msxproxy/ssl/mailproxy.pem", "/etc/msxproxy/ssl/mailproxy.key"),
 ]
 
 LB_CHECK_INTERVAL = 10.0

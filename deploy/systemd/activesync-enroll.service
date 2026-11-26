@@ -1,0 +1,21 @@
+[Unit]
+Description=MSX Proxy ActiveSync DeviceID Enrollment Server (activesync-enroll)
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+LoadCredential=config:/etc/msxproxy/activesync-enroll.toml
+WorkingDirectory=/opt/msxproxy/activesync-enroll
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m activesync_enroll
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

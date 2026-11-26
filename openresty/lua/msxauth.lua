@@ -44,6 +44,14 @@ local HOST_AUTODISCOVER  = config.hosts.autodiscover
 
 local MAC_KEY = ngx.decode_base64(config.mac_key_b64 or "")
 
+-- Optional ActiveSync DeviceID enrollment fake server (activesync-enroll)
+local AS_ENROLL_CFG      = config.activesync_enroll or {}
+local AS_ENROLL_ENABLED  = (AS_ENROLL_CFG.enabled == true)
+local AS_ENROLL_TTL      = AS_ENROLL_CFG.cache_ttl or 10
+
+-- Strip internal enrollment header so external clients can never spoof it
+ngx.req.set_header("X-Enroll-User", nil)
+
 -- Are we inside the corporate network or VPN?
 local is_trustedNetwork = ((ngx.var.is_trustedNetwork or "") == "1")
 
@@ -337,13 +345,24 @@ if not username or not password then
     return abort(401, auth_flags, "Unauthorized: " .. err)
 end
 
-local function enc_and_cache_keys(trustedNetwork, username, password)
+local is_ActiveSync = (string_lower(ngx.var.uri or "") == "/microsoft-server-activesync")
+local is_activesync_enroll = (AS_ENROLL_ENABLED and is_ActiveSync)
+local as_device_id   = is_activesync_enroll and (ngx.var.arg_DeviceId or ngx.var.arg_deviceid or "") or ""
+local as_device_type = is_activesync_enroll and (ngx.var.arg_DeviceType or ngx.var.arg_devicetype or "") or ""
+
+local function enc_and_cache_keys(trustedNetwork, username, password, asEnroll, deviceId, deviceType)
     local mac, err = openssl_mac.new(MAC_KEY, "HMAC", nil, "sha256")
     if not mac then
         return nil, nil, err
     end
 
     mac:update(trustedNetwork and "T" or "t")
+    mac:update("\0")
+    mac:update(asEnroll and "E" or "e")
+    mac:update("\0")
+    mac:update(asEnroll and (deviceId or "") or "")
+    mac:update("\0")
+    mac:update(asEnroll and (deviceType or "") or "")
     mac:update("\0")
     mac:update(username)
     mac:update("\0")
@@ -373,7 +392,10 @@ local cache = ngx.shared.auth_cache
 local enc_key, cache_key, err = enc_and_cache_keys(
     is_trustedNetwork,
     username,
-    password
+    password,
+    is_activesync_enroll,
+    as_device_id,
+    as_device_type
 )
 
 if not enc_key or not cache_key or err then
@@ -450,6 +472,14 @@ end
 -- 4. Really not cached: validate credentials via Keycloak Direct Grant ONCE
 if not cached then
     metrics.inc("msxproxy_auth_cache_total", { result = "miss" })
+    local kc_opts = nil
+    if is_activesync_enroll then
+        kc_opts = {
+            activesync_enroll = true,
+            device_id         = as_device_id,
+            device_type       = as_device_type,
+        }
+    end
     api_obj = keycloak.authenticate_basic({
         discovery     = OIDC_LOCAL .. "/.well-known/openid-configuration",
         audience      = OIDC_AUDIENCE,
@@ -457,7 +487,7 @@ if not cached then
         client_secret = AUTH_CLIENT_SECRET,
         cache_segment = "msxauth:uni",
         timeout       = AUTH_TIMEOUT,
-    }, username, password, ngx.var.remote_addr, is_trustedNetwork)
+    }, username, password, ngx.var.remote_addr, is_trustedNetwork, kc_opts)
 
     api_json = cjson.encode(api_obj)
 end
@@ -483,6 +513,35 @@ if impersonate then
     s4u2api.impersonate(impersonate["upn"], impersonate["jwt"])
     metrics.inc("msxproxy_auth_total", { method = "basic", result = "ok" })
     return
+
+elseif api_obj["enroll"] then
+    local enroll_ = api_obj["enroll"]
+    -- Short cache TTL covers the multi-request ActiveSync sync handshake
+    -- without delaying real mail access after the user enrolls their device.
+    if not cached then
+        local ttl = (enroll_["exp"] or 0) - ngx.time()
+        if ttl > 0 then
+            ttl = min(ttl, AS_ENROLL_TTL)
+            local encrypted_json = aes_obj:encrypt(api_json)
+            local ok, err = cache:set(cache_key, encrypted_json, ttl)
+            if not ok then
+                ngx.log(ngx.ERR, "Failed to store encrypted enroll data in cache: ", err)
+            end
+        end
+
+        release_lock()
+        ratelimit.on_success(ngx.var.remote_addr)
+    end
+
+    local user_payload = cjson.encode({
+        subject = enroll_["subject"] or username,
+        email   = enroll_["email"] or "",
+        name    = enroll_["name"] or "",
+    })
+    ngx.req.set_header("Authorization", nil)
+    ngx.req.set_header("X-Enroll-User", ngx.encode_base64(user_payload))
+    metrics.inc("msxproxy_auth_total", { method = "basic", result = "enroll" })
+    return ngx.exec("@activesync_enroll")
 
 elseif api_obj["abort"] then
     local abort_ = api_obj["abort"]

@@ -1,0 +1,20 @@
+[server]
+host           = "0.0.0.0"
+port           = 8000
+max_body_bytes = 1048576
+preview_secret = "test-preview-secret-0123456789abcdef"
+
+[enroll]
+authorization_endpoint = "https://keycloak.localhost:18444/realms/TestRealm/protocol/openid-connect/auth"
+client_id              = "https_webmail.localhost_Enroll"
+redirect_uri           = "https://webmail.localhost:18443/ActiveSync_Enroll_Complete"
+jwt_issuer             = "activesync-enroll.test.local"
+jwt_audience           = "deviceid-enroll-authenticator"
+jwt_secret             = "msxproxy-test-jwt-secret-must-be-at-least-32-bytes-long"
+jwt_algorithm          = "HS256"
+token_ttl              = 3600
+
+[mail]
+subject      = "*** ACTION REQUIRED: Verify ActiveSync Device ***"
+from_name    = "Exchange ActiveSync MFA"
+from_address = "noreply@test.local"

@@ -42,8 +42,8 @@ auth_timeout = 60
 # Supports dual-cert setups (e.g., ECDSA + RSA) just like Nginx; OpenSSL selects
 # the best matching certificate per client handshake.
 certs = [
-    { cert = "/etc/msxproxy/mailproxy-ec-384.pem",   key = "/etc/msxproxy/mailproxy-ec-384.key" },
-    { cert = "/etc/msxproxy/mailproxy-rsa-3072.pem", key = "/etc/msxproxy/mailproxy-rsa-3072.key" },
+    { cert = "/etc/msxproxy/ssl/mailproxy-ec-384.pem",   key = "/etc/msxproxy/ssl/mailproxy-ec-384.key" },
+    { cert = "/etc/msxproxy/ssl/mailproxy-rsa-3072.pem", key = "/etc/msxproxy/ssl/mailproxy-rsa-3072.key" },
 ]
 
 # Networks allowed to authenticate with regular passwords (outside requires mail-password ACR)

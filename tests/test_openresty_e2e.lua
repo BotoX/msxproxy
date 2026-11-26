@@ -108,13 +108,15 @@ local function make_shared_dict()
     return dict
 end
 
--- Sentinel exception thrown by ngx.exit() to accurately halt script execution like OpenResty
+-- Sentinel exception thrown by ngx.exit() / ngx.exec() to accurately halt script execution like OpenResty
 local EXIT_TAG = {}
 local function make_ngx(vars)
     local req_headers = {}
     local resp_headers = {}
     local body_chunks = {}
     local exited_code = nil
+    local exec_target = nil
+    local uri_args = vars._uri_args or {}
 
     local n
     n = {
@@ -127,6 +129,7 @@ local function make_ngx(vars)
         time = function() return fake_now end,
         log = function() end,
         decode_base64 = decode_base64,
+        encode_base64 = encode_base64,
         encode_args = function(t) return "" end,
         say = function(s) table.insert(body_chunks, tostring(s) .. "\n"); return 1 end,
         print = function(s) table.insert(body_chunks, tostring(s)); return 1 end,
@@ -134,13 +137,19 @@ local function make_ngx(vars)
             exited_code = code
             error({ tag = EXIT_TAG, code = code })
         end,
+        exec = function(target)
+            exec_target = target
+            error({ tag = EXIT_TAG, exec = target })
+        end,
         req = {
             set_header = function(k, v) req_headers[k] = v end,
             get_headers = function() return req_headers end,
+            get_uri_args = function() return uri_args end,
         },
         _state = function()
             return {
                 exited = exited_code,
+                exec_target = exec_target,
                 status = n.status,
                 resp_headers = resp_headers,
                 req_headers = req_headers,
@@ -245,9 +254,9 @@ package.loaded["s4u2api"] = {
 local kc_calls = 0
 local kc_handler = nil
 package.loaded["keycloak"] = {
-    authenticate_basic = function(cfg, u, p, ip, trusted)
+    authenticate_basic = function(cfg, u, p, ip, trusted, opts)
         kc_calls = kc_calls + 1
-        return kc_handler(cfg, u, p, ip, trusted)
+        return kc_handler(cfg, u, p, ip, trusted, opts)
     end,
 }
 
@@ -485,6 +494,98 @@ do
     mock_owa_auth = function() return nil, "discovery failed" end
     local st_owa4 = run_script(owaauth_chunk, { ntlm_pinned_owa_upstream = "" })
     check("owaauth OIDC error returns 500", st_owa4.exited == 500)
+end
+
+-- ── 8. ActiveSync DeviceID enrollment routing & cache isolation ──────────────
+do
+    _G._TEST_SHARED.auth_cache:_clear()
+    _G._TEST_SHARED.auth_failures:_clear()
+    kc_calls = 0
+
+    package.loaded["config"].activesync_enroll = {
+        enabled   = true,
+        cache_ttl = 10,
+    }
+
+    kc_handler = function(cfg, u, p, ip, trusted, opts)
+        if opts and opts.activesync_enroll then
+            if opts.device_id == "ENROLLED-1" then
+                return { impersonate = { upn = "alice@UNI.AT", jwt = "tok_dev", aud = cfg.audience, exp = fake_now + 600 } }
+            end
+            return {
+                enroll = {
+                    subject = "alice",
+                    email   = "alice@uni-graz.at",
+                    name    = "Jürgen Müller",
+                    exp     = fake_now + 600,
+                }
+            }
+        end
+        return { abort = { code = 403, msg = "Insufficient authentication: use special mail password", exp = fake_now + 60 } }
+    end
+
+    local basic_alice = "Basic " .. encode_base64("alice:RegularPassword!")
+
+    -- 8a. Enrolled DeviceId -> impersonate (no exec to @activesync_enroll)
+    local st_enr, imp_enr = run_script(msxauth_chunk, {
+        remote_addr = "203.0.113.88",
+        uri = "/Microsoft-Server-ActiveSync",
+        http_authorization = basic_alice,
+        arg_DeviceId = "ENROLLED-1",
+        arg_DeviceType = "iPhone",
+    })
+    check("enrolled ActiveSync DeviceId impersonates cleanly",
+        st_enr.exited == nil and st_enr.exec_target == nil and #imp_enr == 1 and kc_calls == 1)
+
+    -- 8b. Unenrolled DeviceId with SAME user+password -> MUST NOT hit Device 1's cache!
+    local st_new, imp_new = run_script(msxauth_chunk, {
+        remote_addr = "203.0.113.88",
+        uri = "/Microsoft-Server-ActiveSync",
+        http_authorization = basic_alice,
+        arg_DeviceId = "UNENROLLED-2",
+        arg_DeviceType = "Android",
+    })
+    local decoded_user = st_new.req_headers["X-Enroll-User"] and decode_base64(st_new.req_headers["X-Enroll-User"]) or ""
+    check("unenrolled ActiveSync device execs @activesync_enroll with stripped Authorization & X-Enroll-User",
+        st_new.exec_target == "@activesync_enroll"
+        and #imp_new == 0
+        and kc_calls == 2
+        and st_new.req_headers["Authorization"] == nil
+        and decoded_user:find("Jürgen Müller", 1, true) ~= nil)
+
+    -- 8c. Second handshake request within 10s hits short enroll cache (kc_calls stays 2)
+    local st_new2 = run_script(msxauth_chunk, {
+        remote_addr = "203.0.113.88",
+        uri = "/Microsoft-Server-ActiveSync",
+        http_authorization = basic_alice,
+        arg_DeviceId = "UNENROLLED-2",
+        arg_DeviceType = "Android",
+    })
+    check("repeat unenrolled ActiveSync within 10s hits enroll cache",
+        st_new2.exec_target == "@activesync_enroll" and kc_calls == 2)
+
+    -- 8d. After 11s enroll cache expires -> re-checks Keycloak
+    fake_now = fake_now + 11
+    local st_new3 = run_script(msxauth_chunk, {
+        remote_addr = "203.0.113.88",
+        uri = "/Microsoft-Server-ActiveSync",
+        http_authorization = basic_alice,
+        arg_DeviceId = "UNENROLLED-2",
+        arg_DeviceType = "Android",
+    })
+    check("enroll cache expires after cache_ttl (10s)",
+        st_new3.exec_target == "@activesync_enroll" and kc_calls == 3)
+
+    -- 8e. Non-ActiveSync URI (/EWS/Exchange.asmx) with SAME creds MUST still get 403
+    local st_ews, imp_ews = run_script(msxauth_chunk, {
+        remote_addr = "203.0.113.88",
+        uri = "/EWS/Exchange.asmx",
+        http_authorization = basic_alice,
+    })
+    check("non-ActiveSync URI still returns 403 when activesync_enroll enabled",
+        st_ews.exited == 403 and st_ews.exec_target == nil and #imp_ews == 0)
+
+    package.loaded["config"].activesync_enroll = nil
 end
 
 print("\nALL " .. passed .. " OPENRESTY E2E TESTS PASSED!")

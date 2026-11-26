@@ -4,6 +4,15 @@
 # Restart s4u2api after editing (`systemctl restart s4u2api`).
 
 # ---------------------------------------------------------
+# Listener (set uds to listen on a Unix socket instead of host/port)
+# ---------------------------------------------------------
+[server]
+host = "127.0.0.1"
+port = 7777
+# Optional Unix Domain Socket with optional :octal_mode suffix:
+# uds = "/run/s4u2api/s4u2api.sock:0660"
+
+# ---------------------------------------------------------
 # Keycloak / JWT verification
 # ---------------------------------------------------------
 [oidc]
@@ -24,7 +33,7 @@ socket = "/dev/shm/valkey.sock"
 # Service account principal with Constrained Delegation rights in AD
 principal  = "_msxproxy@PERS.AD.UNI-GRAZ.AT"
 
-# RAM-backed directory for per-user Kerberos ticket caches (pruned daily via tmpfiles.d)
+# RAM-backed directory for per-user Kerberos ticket caches (pruned hourly by s4u2api)
 ccache_dir = "/dev/shm/krb5_msxproxy"
 
 # Fallback keytab path when not running under systemd LoadCredential=krb5_keytab:...

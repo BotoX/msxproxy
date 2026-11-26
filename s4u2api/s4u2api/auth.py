@@ -3,6 +3,7 @@ import httpx
 import jwt
 from jwt.exceptions import PyJWTError
 
+from . import config
 from .config import OIDC_WELL_KNOWN_URL, OIDC_AUDIENCE
 
 logger = logging.getLogger(__name__)
@@ -24,16 +25,30 @@ class KeycloakOIDCClient:
 
         self._setup()
 
-    def _setup(self) -> None:
+    def _fetch_oidc(self, well_known_url: str) -> tuple[dict[str, any], jwt.PyJWKSet]:
         with httpx.Client(timeout=self.timeout) as client:
-            resp = client.get(self.well_known_url)
+            resp = client.get(well_known_url)
             resp.raise_for_status()
-            self._config = resp.json()
+            oidc_cfg = resp.json()
 
-            jwks_uri = self._config['jwks_uri']
+            jwks_uri = oidc_cfg['jwks_uri']
             resp = client.get(jwks_uri)
             resp.raise_for_status()
-            self._jwk_set = jwt.PyJWKSet.from_dict(resp.json())
+            jwk_set = jwt.PyJWKSet.from_dict(resp.json())
+        return oidc_cfg, jwk_set
+
+    def _setup(self) -> None:
+        self._config, self._jwk_set = self._fetch_oidc(self.well_known_url)
+
+    def reload_from_config(self) -> None:
+        """Re-read OIDC settings from s4u2api.config and refresh discovery + JWKS atomically."""
+        new_url = config.OIDC_WELL_KNOWN_URL
+        new_audience = config.OIDC_AUDIENCE
+        new_cfg, new_jwks = self._fetch_oidc(new_url)
+        self.well_known_url = new_url
+        self.audience = new_audience
+        self._config = new_cfg
+        self._jwk_set = new_jwks
 
     @property
     def issuer(self) -> str:

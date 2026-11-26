@@ -1,0 +1,167 @@
+services:
+  valkey:
+    image: valkey/valkey:8-alpine
+    network_mode: none
+    restart: unless-stopped
+    command:
+      - valkey-server
+      - --port
+      - "0"
+      - --unixsocket
+      - /dev/shm/valkey.sock
+      - --unixsocketperm
+      - "777"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --loglevel
+      - notice
+    volumes:
+      - msxproxy_shm:/dev/shm
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-s", "/dev/shm/valkey.sock", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  s4u2api:
+    build:
+      context: ..
+      dockerfile: docker/python/Dockerfile
+    image: msxproxy-python:local
+    network_mode: host
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    working_dir: /opt/msxproxy/s4u2api
+    command:
+      - python3
+      - -m
+      - s4u2api
+      - --log
+      - ${S4U2API_LOG_LEVEL:-INFO}
+      - --workers
+      - ${S4U2API_WORKERS:-1}
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      S4U2API_CONFIG: /etc/msxproxy/s4u2api.toml
+      KRB5_CONFIG: /etc/krb5.conf
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../s4u2api:/opt/msxproxy/s4u2api:ro
+      - ${MSXPROXY_ETC_DIR:-/etc/msxproxy}:/etc/msxproxy:ro
+      - ${KRB5_CONF:-/etc/krb5.conf}:/etc/krb5.conf:ro
+      - msxproxy_shm:/dev/shm
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os, socket; s=socket.create_connection(('127.0.0.1', int(os.environ.get('S4U2API_PORT', '7777'))), 2); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  mailproxy:
+    image: msxproxy-python:local
+    network_mode: host
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    working_dir: /opt/msxproxy/mailproxy
+    command:
+      - python3
+      - -m
+      - mailproxy
+      - --config
+      - /etc/msxproxy/mailproxy.toml
+      - --log
+      - ${MAILPROXY_LOG_LEVEL:-INFO}
+      - --workers
+      - ${MAILPROXY_WORKERS:-1}
+      - --metrics-host
+      - 127.0.0.1
+      - --metrics-port
+      - "9101"
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      MAILPROXY_CONFIG: /etc/msxproxy/mailproxy.toml
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../mailproxy:/opt/msxproxy/mailproxy:ro
+      - ${MSXPROXY_ETC_DIR:-/etc/msxproxy}:/etc/msxproxy:ro
+    depends_on:
+      s4u2api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (143, 993, 587, 465)]"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  openresty:
+    build:
+      context: ./openresty
+      dockerfile: Dockerfile
+      args:
+        NTLM_MODULE_REPO: ${NTLM_MODULE_REPO:-https://github.com/BotoX/upstream-ntlm-nginx-module.git}
+        NTLM_MODULE_REF: ${NTLM_MODULE_REF:-master}
+    image: msxproxy-openresty:local
+    network_mode: host
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    entrypoint: ["/bin/sh", "/etc/msxproxy-openresty/entrypoint.sh"]
+    environment:
+      OPENRESTY_RESOLVER: ${OPENRESTY_RESOLVER:-}
+    volumes:
+      - ./openresty:/etc/msxproxy-openresty:ro
+      - ../deploy/openresty:/opt/msxproxy/deploy/openresty:ro
+      - ../openresty:/opt/msxproxy/openresty:ro
+      - ${MSXPROXY_ETC_DIR:-/etc/msxproxy}:/etc/msxproxy:ro
+    depends_on:
+      s4u2api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSk https://127.0.0.1/status | grep -q 'Nginx Worker PID:'"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  activesync-enroll:
+    profiles: ["activesync-enroll"]
+    image: msxproxy-python:local
+    network_mode: host
+    restart: unless-stopped
+    working_dir: /opt/msxproxy/activesync-enroll
+    command: ["python3", "-m", "activesync_enroll"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      ACTIVESYNC_ENROLL_CONFIG: /etc/msxproxy/activesync-enroll.toml
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ../activesync-enroll:/opt/msxproxy/activesync-enroll:ro
+      - ${MSXPROXY_ETC_DIR:-/etc/msxproxy}:/etc/msxproxy:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  msxproxy_shm:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=128m,mode=1777"

@@ -13,6 +13,11 @@ import tomllib
 DEFAULT_CONFIG_PATH = "/etc/msxproxy/s4u2api.toml"
 CONFIG_PATH: str = os.environ.get("S4U2API_CONFIG", DEFAULT_CONFIG_PATH)
 
+# server (__main__.py)
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 7777
+SERVER_UDS: str | None = None
+
 # auth.py
 OIDC_WELL_KNOWN_URL = "https://login.uni-graz.at/auth/realms/UniGraz/.well-known/openid-configuration"
 OIDC_AUDIENCE = "https_webmail.uni-graz.at"
@@ -33,6 +38,7 @@ KRB5_CLIENT_KTNAME = "FILE:/etc/msxproxy/krb5_keytab"
 
 def load_config(path: str | Path | None = None, *, required: bool = False) -> bool:
     global CONFIG_PATH
+    global SERVER_HOST, SERVER_PORT, SERVER_UDS
     global OIDC_WELL_KNOWN_URL, OIDC_AUDIENCE, VALKEY_SOCK
     global KRB5_PRINCIPAL, KRB5_CCACHE_DIR, KRB5_CLIENT_KTNAME
 
@@ -42,6 +48,15 @@ def load_config(path: str | Path | None = None, *, required: bool = False) -> bo
     if cfg_path.is_file():
         with cfg_path.open("rb") as f:
             data = tomllib.load(f)
+
+        srv = data.get("server", {})
+        if "host" in srv:
+            SERVER_HOST = str(srv["host"])
+        if "port" in srv:
+            SERVER_PORT = int(srv["port"])
+        if "uds" in srv:
+            raw_uds = str(srv["uds"]).strip()
+            SERVER_UDS = raw_uds or None
 
         oidc = data.get("oidc", {})
         if "well_known_url" in oidc:

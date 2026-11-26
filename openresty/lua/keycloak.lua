@@ -41,7 +41,7 @@ local function make_abort(code, msg, ttl)
 end
 
 -- Perform a Keycloak ROPC (password) grant, verify the returned access token,
--- and enforce the mail-password ACR requirement for untrusted networks.
+-- and enforce the mail-password / deviceId ACR policy for untrusted networks.
 --
 -- cfg:
 --   discovery     string       Keycloak .well-known/openid-configuration URL
@@ -51,10 +51,19 @@ end
 --   cache_segment string|nil   Shared-dict cache segment for resty.openidc
 --   timeout       number|nil   HTTP timeout in ms (default 5000)
 --
+-- opts (optional):
+--   activesync_enroll boolean     Allow deviceId ACR and return { enroll = ... } on unenrolled devices
+--   device_id         string|nil  ActiveSync DeviceId query parameter
+--   device_type       string|nil  ActiveSync DeviceType query parameter
+--
 -- Returns:
---   result table: either { impersonate = { upn, jwt, aud, exp } }
---                     or { abort       = { code, msg, exp } }
-function _M.authenticate_basic(cfg, username, password, user_ip, is_trusted_network)
+--   result table: { impersonate = { upn, jwt, aud, exp } }
+--              or { enroll      = { subject, email, name, exp } }
+--              or { abort       = { code, msg, exp } }
+function _M.authenticate_basic(cfg, username, password, user_ip, is_trusted_network, opts)
+    opts = opts or {}
+    local activesync_enroll = (opts.activesync_enroll == true)
+
     local oidc_opts = {
         discovery = cfg.discovery,
         token_signing_alg_values_expected = { "RS256" },
@@ -73,10 +82,18 @@ function _M.authenticate_basic(cfg, username, password, user_ip, is_trusted_netw
         client_id  = cfg.client_id,
         username   = username,
         password   = password,
-        scope      = "openid",
+        scope      = activesync_enroll and "openid profile email" or "openid",
     }
     if cfg.client_secret and cfg.client_secret ~= "" then
         form.client_secret = cfg.client_secret
+    end
+    if activesync_enroll then
+        if opts.device_id and opts.device_id ~= "" then
+            form.DeviceId = opts.device_id
+        end
+        if opts.device_type and opts.device_type ~= "" then
+            form.DeviceType = opts.device_type
+        end
     end
 
     local httpc = resty_http.new()
@@ -183,18 +200,30 @@ function _M.authenticate_basic(cfg, username, password, user_ip, is_trusted_netw
         return make_abort(403, "missing attribute: krb5_principal", 15)
     end
 
-    if not is_trusted_network and claims.acr ~= "mail-password" then
-        return make_abort(403, "Insufficient authentication: use special mail password", 60)
+    local acr = claims.acr or ""
+    if is_trusted_network or acr == "mail-password" or (activesync_enroll and acr == "deviceId") then
+        return {
+            impersonate = {
+                upn = upn,
+                jwt = access_token,
+                aud = claims.aud,
+                exp = claims.exp,
+            }
+        }
     end
 
-    return {
-        impersonate = {
-            upn = upn,
-            jwt = access_token,
-            aud = claims.aud,
-            exp = claims.exp,
+    if activesync_enroll then
+        return {
+            enroll = {
+                subject = claims.preferred_username or username,
+                email   = claims.email or "",
+                name    = claims.name or claims.preferred_username or username,
+                exp     = claims.exp,
+            }
         }
-    }
+    end
+
+    return make_abort(403, "Insufficient authentication: use special mail password", 60)
 end
 
 return _M
