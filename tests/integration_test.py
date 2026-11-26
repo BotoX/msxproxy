@@ -198,8 +198,55 @@ def test_ntlm_upstream_connection_pinning():
         assert conn_id_2 == conn_id_1, f"Expected pinned upstream conn {conn_id_1}, got {conn_id_2}"
         assert r2.getheader("X-Mock-Principal") == f"{TEST_USER}@TEST.LOCAL"
         assert r2.getheader("X-Mock-Auth-Header-Present") == "no"
+
+        # External client presenting NTLM on an already-pinned socket must still get 403
+        conn.request(
+            "OPTIONS",
+            "/Microsoft-Server-ActiveSync",
+            headers={
+                "Authorization": "NTLM TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA=",
+                "Connection": "keep-alive",
+            },
+        )
+        r3 = conn.getresponse()
+        r3.read()
+        assert r3.status == 403
     finally:
         conn.close()
+
+    # Unauthenticated healthcheck endpoint must strip Authorization and never prime an NTLM pin
+    hc_conn = http.client.HTTPSConnection(host, timeout=10, context=_ssl_ctx())
+    try:
+        hc_conn.request(
+            "GET",
+            "/ews/healthcheck.htm",
+            headers={
+                "Authorization": "NTLM TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA=",
+                "Connection": "keep-alive",
+            },
+        )
+        rhc = hc_conn.getresponse()
+        rhc.read()
+        assert rhc.status == 200
+
+        hc_conn.request("OPTIONS", "/Microsoft-Server-ActiveSync", headers={"Connection": "keep-alive"})
+        r_unauth = hc_conn.getresponse()
+        r_unauth.read()
+        assert r_unauth.status == 401
+
+        hc_conn.request(
+            "OPTIONS",
+            "/Microsoft-Server-ActiveSync",
+            headers={
+                "Authorization": "NTLM TlRMTVNTUAABAAAAB4IIAAAAAAAAAAAAAAAAAAAAAAA=",
+                "Connection": "keep-alive",
+            },
+        )
+        r_ntlm = hc_conn.getresponse()
+        r_ntlm.read()
+        assert r_ntlm.status == 403
+    finally:
+        hc_conn.close()
 
 
 def test_autodiscover_xml_rewrite():

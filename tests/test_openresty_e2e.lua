@@ -393,14 +393,29 @@ do
     check("pinned conn strips Basic Authorization header",
         st_pin.exited == nil and st_pin.req_headers["Authorization"] == "" and #imp_pin == 0)
 
-    -- Pinned with NTLM header -> preserves Authorization (does NOT clear it)
-    local st_pin_ntlm = run_script(msxauth_chunk, {
-        remote_addr = "203.0.113.77",
-        ntlm_pinned_exchange_upstream = "42",
-        http_authorization = "NTLM dHlwZTM=",
-    })
-    check("pinned conn preserves NTLM Authorization header",
-        st_pin_ntlm.exited == nil and st_pin_ntlm.req_headers["Authorization"] == nil)
+    -- Pinned on trusted network with NTLM/Negotiate header -> preserves Authorization
+    for _, hdr in ipairs({ "NTLM dHlwZTM=", "Negotiate dGlja2V0" }) do
+        local st_pin_ntlm = run_script(msxauth_chunk, {
+            remote_addr = "10.0.0.77",
+            is_trustedNetwork = "1",
+            ntlm_pinned_exchange_upstream = "42",
+            http_authorization = hdr,
+        })
+        check("trusted pinned conn preserves " .. hdr .. " Authorization header",
+            st_pin_ntlm.exited == nil and st_pin_ntlm.req_headers["Authorization"] == nil)
+    end
+
+    -- Pinned on untrusted external network with NTLM/Negotiate header -> blocked with 403!
+    for _, hdr in ipairs({ "NTLM dHlwZTM=", "Negotiate dGlja2V0" }) do
+        local st_pin_ext, imp_pin_ext = run_script(msxauth_chunk, {
+            remote_addr = "203.0.113.77",
+            is_trustedNetwork = "0",
+            ntlm_pinned_exchange_upstream = "42",
+            http_authorization = hdr,
+        })
+        check("untrusted pinned conn blocks " .. hdr .. " with 403",
+            st_pin_ext.exited == 403 and #imp_pin_ext == 0)
+    end
 
     -- Trigger 15 fresh 401s (distinct bad passwords so cache misses) -> 15th becomes 429
     kc_handler = function()

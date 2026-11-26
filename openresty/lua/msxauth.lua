@@ -229,11 +229,16 @@ local auth_method, auth_payload = authorization.split_header(ngx.var.http_author
 
 -- Skip re-auth logic if we already have an NTLM-pinned upstream for this connection.
 if is_pinned then
-    metrics.inc("msxproxy_auth_total", { method = "pinned", result = "ok" })
-    if auth_method ~= "ntlm" and auth_method ~= "negotiate" then
-        -- Clear Authorization from client unless it's NTLM or Negotiate
+    if auth_method == "ntlm" or auth_method == "negotiate" then
+        if not is_trustedNetwork then
+            metrics.inc("msxproxy_auth_total", { method = "ntlm", result = "403" })
+            return abort(403, nil, "Legacy authentication not allowed from this network.")
+        end
+    else
+        -- Clear Authorization from client unless it's trusted NTLM or Negotiate
         ngx.req.set_header("Authorization", "")
     end
+    metrics.inc("msxproxy_auth_total", { method = "pinned", result = "ok" })
     return
 end
 
