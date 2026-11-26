@@ -112,6 +112,12 @@ end
 local EXIT_TAG = {}
 local function make_ngx(vars)
     local req_headers = {}
+    if vars._req_headers then
+        for k, v in pairs(vars._req_headers) do
+            req_headers[k] = v
+        end
+    end
+    local cleared_req_headers = {}
     local resp_headers = {}
     local body_chunks = {}
     local exited_code = nil
@@ -124,6 +130,8 @@ local function make_ngx(vars)
         HTTP_OK = 200, HTTP_BAD_REQUEST = 400, HTTP_INTERNAL_SERVER_ERROR = 500,
         status = 200,
         var = vars,
+        ctx = {},
+        arg = {},
         header = resp_headers,
         shared = _G._TEST_SHARED,
         time = function() return fake_now end,
@@ -143,6 +151,7 @@ local function make_ngx(vars)
         end,
         req = {
             set_header = function(k, v) req_headers[k] = v end,
+            clear_header = function(k) cleared_req_headers[k] = true; req_headers[k] = nil end,
             get_headers = function() return req_headers end,
             get_uri_args = function() return uri_args end,
         },
@@ -151,8 +160,10 @@ local function make_ngx(vars)
                 exited = exited_code,
                 exec_target = exec_target,
                 status = n.status,
+                ctx = n.ctx,
                 resp_headers = resp_headers,
                 req_headers = req_headers,
+                cleared_req_headers = cleared_req_headers,
                 body = table.concat(body_chunks),
             }
         end,
@@ -509,6 +520,44 @@ do
     mock_owa_auth = function() return nil, "discovery failed" end
     local st_owa4 = run_script(owaauth_chunk, { ntlm_pinned_owa_upstream = "" })
     check("owaauth OIDC error returns 500", st_owa4.exited == 500)
+
+    -- OWA logout rewrite integration (prepare_request called for both pinned & unpinned)
+    mock_owa_auth = function() return { access_token = "owa.tok" }, nil end
+    mock_jwt_loaded = { valid = true, payload = { krb5_principal = "carol@UNI.AT" } }
+
+    local st_sd = run_script(owaauth_chunk, {
+        ntlm_pinned_owa_upstream = "150",
+        uri = "/owa/sessiondata.ashx",
+        _req_headers = { ["Accept-Encoding"] = "gzip, deflate, br" },
+    })
+    check("owaauth flags pinned /owa/sessiondata.ashx for logout rewrite & clears Accept-Encoding",
+        st_sd.exited == nil
+        and st_sd.ctx.owa_rewrite_logout == true
+        and st_sd.cleared_req_headers["Accept-Encoding"] == true
+        and st_sd.req_headers["Accept-Encoding"] == nil)
+
+    local st_svc = run_script(owaauth_chunk, {
+        ntlm_pinned_owa_upstream = "",
+        uri = "/owa/shared@uni-graz.at/service.svc",
+        _uri_args = { action = "GetOwaUserConfiguration" },
+        _req_headers = { ["Accept-Encoding"] = "gzip" },
+    })
+    check("owaauth flags explicit-logon GetOwaUserConfiguration for logout rewrite",
+        st_svc.exited == nil
+        and st_svc.ctx.owa_rewrite_logout == true
+        and st_svc.cleared_req_headers["Accept-Encoding"] == true)
+
+    local st_find = run_script(owaauth_chunk, {
+        ntlm_pinned_owa_upstream = "150",
+        uri = "/owa/service.svc",
+        _uri_args = { action = "FindItem" },
+        _req_headers = { ["Accept-Encoding"] = "gzip" },
+    })
+    check("owaauth does NOT strip Accept-Encoding on non-config service.svc actions",
+        st_find.exited == nil
+        and st_find.ctx.owa_rewrite_logout == nil
+        and st_find.cleared_req_headers["Accept-Encoding"] == nil
+        and st_find.req_headers["Accept-Encoding"] == "gzip")
 end
 
 -- ── 8. ActiveSync DeviceID enrollment routing & cache isolation ──────────────

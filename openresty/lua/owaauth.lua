@@ -4,6 +4,7 @@ local resty_jwt = require("resty.jwt")
 local s4u2api = require("s4u2api")
 local config = require("config")
 local metrics = require("metrics")
+local owalogout = require("owalogout")
 
 local owa_cfg = config.oidc.owa
 local issuer  = config.oidc.local_issuer:gsub("/+$", "")
@@ -20,7 +21,8 @@ local opts = {
     introspection_enable_negative_cache = true,
     cache_segment = "webmail:owa",
     session_contents = {
-        access_token = true
+        access_token = true,
+        enc_id_token = true,
     }
 }
 local session_opts = {
@@ -64,3 +66,5 @@ else
     s4u2api.impersonate(upn, res.access_token)
     metrics.inc("msxproxy_auth_total", { method = "owa", result = "ok" })
 end
+
+owalogout.prepare_request()

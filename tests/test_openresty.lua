@@ -369,4 +369,135 @@ do
         and res_enroll.enroll.name == "Alice Example")
 end
 
+-- ── 5. owalogout.lua ─────────────────────────────────────────────────────────
+local owalogout = require("owalogout")
+
+do
+    -- 5a. should_rewrite_request matching
+    check("owalogout matches /owa/sessiondata.ashx",
+        owalogout.should_rewrite_request("/owa/sessiondata.ashx", {}, {}))
+    check("owalogout matches mixed-case /OWA/SessionData.ashx",
+        owalogout.should_rewrite_request("/OWA/SessionData.ashx", {}, {}))
+    check("owalogout matches explicit-logon /owa/other@uni-graz.at/sessiondata.ashx",
+        owalogout.should_rewrite_request("/owa/other@uni-graz.at/sessiondata.ashx", {}, {}))
+    check("owalogout matches /owa/service.svc?action=GetOwaUserConfiguration",
+        owalogout.should_rewrite_request("/owa/service.svc", { action = "GetOwaUserConfiguration" }, {}))
+    check("owalogout matches /owa/service.svc with mixed-case Action query arg & repeated table",
+        owalogout.should_rewrite_request("/owa/service.svc", { Action = { "Other", "getowauserconfiguration" }, flag = true }, {}))
+    check("owalogout matches /owa/service.svc with Action header",
+        owalogout.should_rewrite_request("/owa/service.svc", {}, { Action = "GetOwaUserConfiguration" }))
+    check("owalogout matches explicit-logon /owa/shared@uni-graz.at/service.svc with X-OWA-ActionName header",
+        owalogout.should_rewrite_request("/owa/shared@uni-graz.at/service.svc", {}, { ["X-OWA-ActionName"] = "GetOwaUserConfiguration" }))
+
+    -- Negative request matches
+    check("owalogout skips /owa/",
+        not owalogout.should_rewrite_request("/owa/", {}, {}))
+    check("owalogout skips /owa/service.svc?action=FindItem",
+        not owalogout.should_rewrite_request("/owa/service.svc", { action = "FindItem" }, { Action = "FindItem" }))
+    check("owalogout skips /owa/prem/15.1.2507.71/scripts/boot.owaframe.2.mouse.js",
+        not owalogout.should_rewrite_request("/owa/prem/15.1.2507.71/scripts/boot.owaframe.2.mouse.js", {}, {}))
+    check("owalogout skips nil URI",
+        not owalogout.should_rewrite_request(nil, {}, {}))
+
+    -- 5b. header_filter guards
+    local saved_ngx = _G.ngx
+
+    local function run_header_filter(status, headers, flagged)
+        local ctx = { owa_rewrite_logout = flagged }
+        _G.ngx = { status = status, header = headers, ctx = ctx }
+        owalogout.header_filter()
+        return ctx, headers
+    end
+
+    local ctx1, h1 = run_header_filter(200, {
+        ["Content-Type"] = "application/x-javascript",
+        content_length = "129000",
+        etag = '"abc"',
+    }, true)
+    check("header_filter keeps flag and clears content_length/etag on 200 application/x-javascript",
+        ctx1.owa_rewrite_logout == true and h1.content_length == nil and h1.etag == nil)
+
+    local ctx2, h2 = run_header_filter(200, {
+        ["Content-Type"] = "application/json; charset=utf-8",
+        content_length = "4096",
+    }, true)
+    check("header_filter keeps flag on 200 application/json",
+        ctx2.owa_rewrite_logout == true and h2.content_length == nil)
+
+    local ctx3, h3 = run_header_filter(200, {
+        ["Content-Type"] = "application/x-javascript",
+        ["Content-Encoding"] = "gzip",
+        content_length = "1024",
+    }, true)
+    check("header_filter disables rewrite if upstream response is gzipped",
+        ctx3.owa_rewrite_logout == false and h3.content_length == "1024")
+
+    local ctx4, h4 = run_header_filter(500, {
+        ["Content-Type"] = "application/json",
+        content_length = "50",
+    }, true)
+    check("header_filter disables rewrite on non-200 status",
+        ctx4.owa_rewrite_logout == false and h4.content_length == "50")
+
+    local ctx5, h5 = run_header_filter(200, {
+        ["Content-Type"] = "text/html; charset=utf-8",
+        content_length = "500",
+    }, true)
+    check("header_filter disables rewrite on text/html",
+        ctx5.owa_rewrite_logout == false and h5.content_length == "500")
+
+    -- 5c. body_filter streaming rewrite across arbitrary chunk boundaries
+    local function run_body_filter(chunks)
+        local ctx = { owa_rewrite_logout = true }
+        local out = {}
+        for i = 1, #chunks do
+            local is_eof = (i == #chunks)
+            _G.ngx = { ctx = ctx, arg = { chunks[i], is_eof } }
+            owalogout.body_filter()
+            if _G.ngx.arg[1] and _G.ngx.arg[1] ~= "" then
+                table.insert(out, _G.ngx.arg[1])
+            end
+        end
+        return table.concat(out)
+    end
+
+    local sample = '{"owaUserConfig":{"ApplicationSettings":{"CheckForForgottenAttachmentsEnabled":true,"CloseWindowOnLogout":true,"ConsoleTracingEnabled":false,"IsLegacySignOut":true}},"Subject":"\\"CloseWindowOnLogout\\":true"}'
+    local expected = '{"owaUserConfig":{"ApplicationSettings":{"CheckForForgottenAttachmentsEnabled":true,"CloseWindowOnLogout":false,"ConsoleTracingEnabled":false,"IsLegacySignOut":true}},"Subject":"\\"CloseWindowOnLogout\\":true"}'
+
+    -- Single chunk
+    check("body_filter single-chunk rewrite preserves escaped string literal",
+        run_body_filter({ sample }) == expected)
+
+    -- Final empty EOF chunk (typical nginx behavior)
+    check("body_filter handles trailing empty EOF chunk",
+        run_body_filter({ sample, "" }) == expected)
+
+    -- Split at EVERY possible 2-chunk boundary
+    local all_splits_ok = true
+    for split = 1, #sample - 1 do
+        local got = run_body_filter({ sample:sub(1, split), sample:sub(split + 1) })
+        if got ~= expected then
+            all_splits_ok = false
+            break
+        end
+    end
+    check("body_filter rewrites cleanly across every 2-chunk split boundary", all_splits_ok)
+
+    -- 1-byte chunks (worst-case streaming fragmentation)
+    local byte_chunks = {}
+    for i = 1, #sample do
+        byte_chunks[i] = sample:sub(i, i)
+    end
+    check("body_filter rewrites cleanly with 1-byte chunks",
+        run_body_filter(byte_chunks) == expected)
+
+    -- Whitespace + closing brace + already false + multiple occurrences
+    local spaced = '{"a":1,"CloseWindowOnLogout" : true },{"CloseWindowOnLogout":false},{"CloseWindowOnLogout":true,"b":2}'
+    local spaced_expected = '{"a":1,"CloseWindowOnLogout" : false },{"CloseWindowOnLogout":false},{"CloseWindowOnLogout":false,"b":2}'
+    check("body_filter handles whitespace, closing brace, already-false, and multiple matches",
+        run_body_filter({ spaced:sub(1, 25), "", spaced:sub(26, 70), spaced:sub(71) }) == spaced_expected)
+
+    _G.ngx = saved_ngx
+end
+
 print("\nALL " .. passed .. " OPENRESTY LUA TESTS PASSED!")

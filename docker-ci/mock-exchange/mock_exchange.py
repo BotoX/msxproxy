@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import gzip
 import itertools
+import json
 import logging
 import os
 import re
@@ -228,6 +230,50 @@ async def handle_https(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                     xml_body,
                     keep_alive,
                 )
+
+            elif re.match(r"^/owa/([^/]+/)?sessiondata\.ashx$", path, re.IGNORECASE):
+                payload = json.dumps(
+                    {
+                        "owaUserConfig": {
+                            "ApplicationSettings": {
+                                "CheckForForgottenAttachmentsEnabled": True,
+                                "CloseWindowOnLogout": True,
+                                "ConsoleTracingEnabled": False,
+                                "IsLegacySignOut": True,
+                            }
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                sd_hdrs = {**base_hdrs, "Content-Type": "application/x-javascript"}
+                if "gzip" in headers.get("accept-encoding", "").lower():
+                    payload = gzip.compress(payload)
+                    sd_hdrs["Content-Encoding"] = "gzip"
+                resp = _build_http_response(200, "OK", sd_hdrs, payload, keep_alive)
+
+            elif re.match(r"^/owa/([^/]+/)?service\.svc$", path, re.IGNORECASE) and (
+                any(
+                    v.lower() == "getowauserconfiguration"
+                    for v in (qs.get("action") or qs.get("Action") or [])
+                )
+                or headers.get("action", "").lower() == "getowauserconfiguration"
+                or headers.get("x-owa-actionname", "").lower() == "getowauserconfiguration"
+            ):
+                payload = json.dumps(
+                    {
+                        "Body": {
+                            "ApplicationSettings": {
+                                "CloseWindowOnLogout": True,
+                            }
+                        }
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                svc_hdrs = {**base_hdrs, "Content-Type": "application/json; charset=utf-8"}
+                if "gzip" in headers.get("accept-encoding", "").lower():
+                    payload = gzip.compress(payload)
+                    svc_hdrs["Content-Encoding"] = "gzip"
+                resp = _build_http_response(200, "OK", svc_hdrs, payload, keep_alive)
 
             elif path.lower().startswith("/owa"):
                 body = f"Mock OWA OK for {pinned_upn}\n".encode("utf-8")

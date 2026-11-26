@@ -147,7 +147,11 @@ def test_e2e_owa_oidc_pkce_login_and_logout():
     Full browser OWA OIDC Authorization Code + PKCE flow:
       1. GET /owa/ redirects to Keycloak login.
       2. Submit credentials -> redirects through /owa/redirect_uri -> reaches mock-exchange /owa/.
-      3. GET /owa/logout returns Connection: close.
+      3. POST /owa/sessiondata.ashx & service.svc?action=GetOwaUserConfiguration have
+         CloseWindowOnLogout rewritten from true to false (even with Accept-Encoding: gzip).
+      4. GET /owa/logoff.owa, /owa/<mailbox>/logoff.owa, /ecp/logoff.owa redirect 302 -> /owa/logout
+         with Connection: close.
+      5. GET /owa/logout returns Connection: close.
     """
     with _client(follow_redirects=True) as browser:
         r_start = browser.get(f"{WEBMAIL_URL}/owa/")
@@ -163,6 +167,40 @@ def test_e2e_owa_oidc_pkce_login_and_logout():
         assert str(r_owa.url).startswith(f"{WEBMAIL_URL}/owa")
         assert f"Mock OWA OK for {TEST_USER}@TEST.LOCAL" in r_owa.text
         assert r_owa.headers.get("x-mock-principal") == f"{TEST_USER}@TEST.LOCAL"
+
+        # Verify OpenResty strips Accept-Encoding upstream and rewrites CloseWindowOnLogout -> false
+        r_sd = browser.post(
+            f"{WEBMAIL_URL}/owa/sessiondata.ashx",
+            params={"appcacheclient": "0"},
+            headers={"Accept-Encoding": "gzip, deflate"},
+        )
+        assert r_sd.status_code == 200
+        sd_data = r_sd.json()
+        assert sd_data["owaUserConfig"]["ApplicationSettings"]["CloseWindowOnLogout"] is False
+
+        r_svc = browser.post(
+            f"{WEBMAIL_URL}/owa/service.svc",
+            params={"action": "GetOwaUserConfiguration"},
+            headers={"Accept-Encoding": "gzip"},
+        )
+        assert r_svc.status_code == 200
+        svc_data = r_svc.json()
+        assert svc_data["Body"]["ApplicationSettings"]["CloseWindowOnLogout"] is False
+
+    # Verify logoff.owa redirects (standard, explicit logon, ECP) and /owa/logout Connection: close
+    host = urllib.parse.urlsplit(WEBMAIL_URL).netloc
+    for path in ("/owa/logoff.owa", "/owa/shared@test.local/logoff.owa", "/ecp/logoff.owa"):
+        conn = http.client.HTTPSConnection(host, timeout=10, context=_ssl_ctx())
+        try:
+            conn.request("GET", path, headers={"Connection": "keep-alive"})
+            resp = conn.getresponse()
+            resp.read()
+            assert resp.status == 302, f"{path}: expected 302, got {resp.status}"
+            loc_path = urllib.parse.urlsplit(resp.getheader("Location") or "").path
+            assert loc_path == "/owa/logout", f"{path}: expected /owa/logout, got {loc_path!r}"
+            assert (resp.getheader("Connection") or "").lower() == "close", f"{path}: expected Connection: close"
+        finally:
+            conn.close()
 
 
 def test_ntlm_upstream_connection_pinning():

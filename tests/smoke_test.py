@@ -13,8 +13,10 @@ Usage:
 """
 import argparse
 import base64
+import gzip
 import html
 import http.client
+import http.cookiejar
 import json
 import os
 import re
@@ -209,6 +211,108 @@ def main() -> int:
         return f"redirect={st}, logout Connection: close"
 
     run_check("OWA OIDC redirect & /owa/logout Connection: close", chk_owa_redirect_and_logout)
+
+    # 2b. OWA/ECP logoff.owa -> 302 /owa/logout (Connection: close)
+    def chk_owa_logoff_redirect():
+        host = webmail_url.split("://", 1)[1].split("/", 1)[0]
+        paths = ("/owa/logoff.owa", "/owa/smoketest@example.invalid/logoff.owa", "/ecp/logoff.owa")
+        for path in paths:
+            conn = http.client.HTTPSConnection(host, timeout=10, context=make_ssl_context(verify_tls))
+            try:
+                conn.request("GET", path, headers={"Connection": "keep-alive"})
+                resp = conn.getresponse()
+                resp.read()
+                loc = resp.getheader("Location") or ""
+                loc_path = urllib.parse.urlsplit(loc).path
+                conn_hdr = (resp.getheader("Connection") or "").lower()
+            finally:
+                conn.close()
+            assert resp.status == 302, f"{path}: expected 302, got {resp.status}"
+            assert loc_path == "/owa/logout", f"{path}: expected Location path /owa/logout, got {loc!r}"
+            assert conn_hdr == "close", f"{path}: expected Connection: close, got {conn_hdr!r}"
+        return f"{len(paths)} logoff.owa paths -> 302 /owa/logout (Connection: close)"
+
+    run_check("OWA/ECP logoff.owa -> 302 /owa/logout", chk_owa_logoff_redirect)
+
+    # 2c. Authenticated OWA sessiondata.ashx CloseWindowOnLogout rewrite
+    def chk_owa_close_window_on_logout_rewrite():
+        if not (test_user and test_regular_pw):
+            raise SkipCheck("set TEST_USER and TEST_REGULAR_PASSWORD")
+        ctx = make_ssl_context(verify_tls)
+        jar = http.cookiejar.CookieJar()
+        follow_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPCookieProcessor(jar),
+        )
+        no_redir_opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=ctx),
+            urllib.request.HTTPCookieProcessor(jar),
+            NoRedirect(),
+        )
+        try:
+            with follow_opener.open(urllib.request.Request(f"{webmail_url}/owa/"), timeout=15) as r_login:
+                login_url = r_login.geturl()
+                login_html = r_login.read().decode("utf-8", errors="replace")
+
+            m_action = re.search(r'<form[^>]+action="([^"]+)"', login_html)
+            if not m_action or 'name="username"' not in login_html or 'name="password"' not in login_html:
+                raise SkipCheck("OIDC login page has no standard username/password form")
+
+            form_url = urllib.parse.urljoin(login_url, html.unescape(m_action.group(1)))
+            form_data = urllib.parse.urlencode({
+                "username": test_user,
+                "password": test_regular_pw,
+                "credentialId": "",
+            }).encode("utf-8")
+            post_req = urllib.request.Request(
+                form_url,
+                data=form_data,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            with follow_opener.open(post_req, timeout=15) as r_owa:
+                landed_url = r_owa.geturl()
+                r_owa.read()
+
+            if not landed_url.startswith(f"{webmail_url}/owa"):
+                raise SkipCheck("OIDC login did not redirect to /owa/ (MFA or interactive step required)")
+            if "languageselection.aspx" in landed_url.lower():
+                raise SkipCheck("test mailbox requires initial OWA language/timezone selection")
+
+            sd_req = urllib.request.Request(
+                f"{webmail_url}/owa/sessiondata.ashx?appcacheclient=0",
+                data=b"",
+                method="POST",
+                headers={"Accept-Encoding": "gzip, deflate"},
+            )
+            try:
+                with no_redir_opener.open(sd_req, timeout=15) as r_sd:
+                    sd_status = r_sd.status
+                    sd_hdrs = {k.lower(): v for k, v in r_sd.headers.items()}
+                    sd_raw = r_sd.read()
+            except urllib.error.HTTPError as e:
+                sd_status = e.code
+                sd_hdrs = {k.lower(): v for k, v in e.headers.items()}
+                sd_raw = e.read()
+
+            assert sd_status == 200, f"expected 200 from /owa/sessiondata.ashx, got {sd_status}"
+            if sd_hdrs.get("content-encoding", "").lower() == "gzip":
+                sd_raw = gzip.decompress(sd_raw)
+            sd_text = sd_raw.decode("utf-8", errors="replace")
+            sd_json = json.loads(sd_text)
+            app_settings = sd_json.get("owaUserConfig", {}).get("ApplicationSettings", {})
+            assert "CloseWindowOnLogout" in app_settings, "CloseWindowOnLogout missing from sessiondata.ashx"
+            assert app_settings["CloseWindowOnLogout"] is False, (
+                f"expected CloseWindowOnLogout=false, got {app_settings['CloseWindowOnLogout']!r}"
+            )
+            return "CloseWindowOnLogout=false in /owa/sessiondata.ashx"
+        finally:
+            try:
+                follow_opener.open(urllib.request.Request(f"{webmail_url}/owa/logout"), timeout=5).read()
+            except Exception:
+                pass
+
+    run_check("OWA sessiondata.ashx CloseWindowOnLogout=false rewrite", chk_owa_close_window_on_logout_rewrite)
 
     # 3. Unauthenticated ActiveSync returns 401 with WWW-Authenticate
     def chk_unauth_401():
