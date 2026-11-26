@@ -2,11 +2,15 @@
 # deploy/deploy.sh — Install, check, reload, or safely upgrade msxproxy from git.
 #
 # Usage:
-#   sudo ./deploy/deploy.sh install           # First-time Ubuntu setup (idempotent)
-#   sudo ./deploy/deploy.sh update [git-ref]  # Pull/checkout, test, nginx -t, reload/restart
-#   sudo ./deploy/deploy.sh reload            # Zero-downtime reload of OpenResty & mailproxy (certs/config)
-#   sudo ./deploy/deploy.sh check             # Verify symlinks, /etc/msxproxy configs, offline tests & nginx -t
-#   sudo ./deploy/deploy.sh test [args...]    # Run live smoke test (tests/smoke_test.py)
+#   sudo ./deploy/deploy.sh install            # First-time Ubuntu setup (idempotent)
+#   sudo ./deploy/deploy.sh up [service...]    # Start core (+ enabled activesync-enroll) or named services
+#   sudo ./deploy/deploy.sh down               # Stop msxproxy services
+#   sudo ./deploy/deploy.sh reload [service...]        # Zero-downtime reload (all active or named services)
+#   sudo ./deploy/deploy.sh restart [service...]       # Restart services (all active or named services)
+#   sudo ./deploy/deploy.sh update [git-ref]           # Pull/checkout, test, nginx -t, reload/restart
+#   ./deploy/deploy.sh status [service...]             # Show systemd service status
+#   ./deploy/deploy.sh check                           # Verify symlinks, /etc/msxproxy configs, offline tests & nginx -t
+#   ./deploy/deploy.sh test [args...]                  # Run live smoke test (tests/smoke_test.py)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -228,30 +232,166 @@ cmd_check() {
     ok "All checks passed."
 }
 
-cmd_reload() {
-    require_root "$@"
-    check_nginx
+resolve_service() {
+    case "$1" in
+        openresty|"${OPENRESTY_SERVICE}") echo "${OPENRESTY_SERVICE}" ;;
+        s4u2api|mailproxy|activesync-enroll) echo "$1" ;;
+        valkey|valkey-server) echo "valkey-server" ;;
+        *) die "Unknown service '$1'. Valid services: openresty, mailproxy, s4u2api, activesync-enroll, valkey-server" ;;
+    esac
+}
 
-    if systemctl is-active --quiet "${OPENRESTY_SERVICE}"; then
-        log "Gracefully reloading ${OPENRESTY_SERVICE}..."
-        systemctl reload "${OPENRESTY_SERVICE}"
-        ok "Reloaded ${OPENRESTY_SERVICE}."
+cmd_up() {
+    require_root up "$@"
+    local svcs=()
+    if (( $# > 0 )); then
+        for arg in "$@"; do
+            svcs+=("$(resolve_service "${arg}")")
+        done
+    else
+        if systemctl list-unit-files valkey-server.service >/dev/null 2>&1; then
+            svcs+=(valkey-server)
+        fi
+        svcs+=(s4u2api mailproxy "${OPENRESTY_SERVICE}")
+        if systemctl is-enabled --quiet activesync-enroll 2>/dev/null; then
+            svcs+=(activesync-enroll)
+        fi
     fi
-    if systemctl is-active --quiet mailproxy; then
-        log "Hot-reloading mailproxy (SIGHUP: config, TLS certs, JWKS, backends)..."
-        systemctl reload mailproxy
-        ok "Reloaded mailproxy."
+
+    for svc in "${svcs[@]}"; do
+        if [[ "${svc}" == "${OPENRESTY_SERVICE}" ]]; then
+            check_nginx
+            break
+        fi
+    done
+
+    log "Starting services: ${svcs[*]}..."
+    systemctl start "${svcs[@]}"
+    ok "Services started: ${svcs[*]}."
+    cmd_status "${svcs[@]}"
+}
+
+cmd_down() {
+    require_root down "$@"
+    local svcs=()
+    for svc in "${OPENRESTY_SERVICE}" mailproxy activesync-enroll s4u2api; do
+        if systemctl is-active --quiet "${svc}"; then
+            svcs+=("${svc}")
+        fi
+    done
+    if (( ${#svcs[@]} == 0 )); then
+        log "No running msxproxy services to stop."
+        return 0
     fi
-    if systemctl is-active --quiet s4u2api; then
-        log "Hot-reloading s4u2api (SIGHUP: config, valid_spns, JWKS, keytab)..."
-        systemctl reload s4u2api
-        ok "Reloaded s4u2api."
+    log "Stopping services: ${svcs[*]}..."
+    systemctl stop "${svcs[@]}"
+    ok "Services stopped: ${svcs[*]}."
+}
+
+reload_one() {
+    local svc
+    svc="$(resolve_service "$1")"
+    case "${svc}" in
+        "${OPENRESTY_SERVICE}")
+            systemctl is-active --quiet "${OPENRESTY_SERVICE}" || die "Service '${OPENRESTY_SERVICE}' is not active."
+            check_nginx
+            log "Gracefully reloading ${OPENRESTY_SERVICE}..."
+            systemctl reload "${OPENRESTY_SERVICE}"
+            ok "Reloaded ${OPENRESTY_SERVICE}."
+            ;;
+        mailproxy)
+            systemctl is-active --quiet mailproxy || die "Service 'mailproxy' is not active."
+            log "Hot-reloading mailproxy (SIGHUP: config, TLS certs, JWKS, backends, ratelimit)..."
+            systemctl reload mailproxy
+            ok "Reloaded mailproxy."
+            ;;
+        s4u2api)
+            systemctl is-active --quiet s4u2api || die "Service 's4u2api' is not active."
+            log "Hot-reloading s4u2api (SIGHUP: config, valid_spns, JWKS, keytab)..."
+            systemctl reload s4u2api
+            ok "Reloaded s4u2api."
+            ;;
+        activesync-enroll)
+            systemctl is-active --quiet activesync-enroll || die "Service 'activesync-enroll' is not active."
+            log "Hot-reloading activesync-enroll (SIGHUP: config, templates, secrets)..."
+            systemctl reload activesync-enroll
+            ok "Reloaded activesync-enroll."
+            ;;
+        *)
+            die "Service '${svc}' does not support reload."
+            ;;
+    esac
+}
+
+cmd_reload() {
+    require_root reload "$@"
+    if (( $# > 0 )); then
+        for svc in "$@"; do
+            reload_one "${svc}"
+        done
+        return 0
     fi
-    if systemctl is-active --quiet activesync-enroll; then
-        log "Hot-reloading activesync-enroll (SIGHUP: config, templates, secrets)..."
-        systemctl reload activesync-enroll
-        ok "Reloaded activesync-enroll."
+
+    local reloaded=0
+    for svc in "${OPENRESTY_SERVICE}" mailproxy s4u2api activesync-enroll; do
+        if systemctl is-active --quiet "${svc}"; then
+            reload_one "${svc}"
+            reloaded=1
+        fi
+    done
+    if [[ "${reloaded}" -eq 0 ]]; then
+        warn "No active msxproxy services found to reload."
     fi
+}
+
+cmd_restart() {
+    require_root restart "$@"
+    local svcs=()
+    if (( $# > 0 )); then
+        for arg in "$@"; do
+            svcs+=("$(resolve_service "${arg}")")
+        done
+    else
+        for svc in s4u2api mailproxy "${OPENRESTY_SERVICE}" activesync-enroll; do
+            if systemctl is-active --quiet "${svc}"; then
+                svcs+=("${svc}")
+            fi
+        done
+        if (( ${#svcs[@]} == 0 )); then
+            warn "No active msxproxy services found to restart."
+            return 0
+        fi
+    fi
+
+    for svc in "${svcs[@]}"; do
+        if [[ "${svc}" == "${OPENRESTY_SERVICE}" ]]; then
+            check_nginx
+            break
+        fi
+    done
+
+    log "Restarting services: ${svcs[*]}..."
+    systemctl restart "${svcs[@]}"
+    ok "Services restarted: ${svcs[*]}."
+    cmd_status "${svcs[@]}"
+}
+
+cmd_status() {
+    local svcs=()
+    if (( $# > 0 )); then
+        for arg in "$@"; do
+            svcs+=("$(resolve_service "${arg}")")
+        done
+    else
+        if systemctl list-unit-files valkey-server.service >/dev/null 2>&1; then
+            svcs+=(valkey-server)
+        fi
+        svcs+=(s4u2api mailproxy "${OPENRESTY_SERVICE}")
+        if systemctl is-enabled --quiet activesync-enroll 2>/dev/null || systemctl is-active --quiet activesync-enroll 2>/dev/null; then
+            svcs+=(activesync-enroll)
+        fi
+    fi
+    systemctl --no-pager --lines=0 status "${svcs[@]}" || true
 }
 
 cmd_update() {
@@ -288,11 +428,7 @@ cmd_update() {
     done
 
     ok "Update complete ($(git rev-parse --short HEAD))."
-    local status_svcs=("${OPENRESTY_SERVICE}" s4u2api mailproxy)
-    if systemctl is-active --quiet activesync-enroll; then
-        status_svcs+=(activesync-enroll)
-    fi
-    systemctl --no-pager --lines=0 status "${status_svcs[@]}" || true
+    cmd_status
 }
 
 cmd_test() {
@@ -302,12 +438,16 @@ cmd_test() {
 
 case "${1:-}" in
     install) shift; cmd_install "$@" ;;
-    update)  shift; cmd_update "$@" ;;
+    up)      shift; cmd_up "$@" ;;
+    down)    shift; cmd_down "$@" ;;
     reload)  shift; cmd_reload "$@" ;;
+    restart) shift; cmd_restart "$@" ;;
+    update)  shift; cmd_update "$@" ;;
+    status)  shift; cmd_status "$@" ;;
     check)   shift; cmd_check "$@" ;;
     test)    shift; cmd_test "$@" ;;
     *)
-        echo "Usage: $0 {install|update [git-ref]|reload|check|test [args...]}" >&2
+        echo "Usage: $0 {install|up [service...]|down|reload [service...]|restart [service...]|update [git-ref]|status [service...]|check|test [args...]}" >&2
         exit 1
         ;;
 esac

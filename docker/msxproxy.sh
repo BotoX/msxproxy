@@ -219,6 +219,7 @@ cmd_restart() {
         "${COMPOSE[@]}" --profile activesync-enroll restart "${svcs[@]}"
     fi
     ok "Restart complete."
+    "${COMPOSE[@]}" --profile activesync-enroll ps "$@"
 }
 
 cmd_update() {
