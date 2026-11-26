@@ -22,13 +22,16 @@ class MetricsRegistry:
             ("imap", "auth_ok"): multiprocessing.Value("Q", 0),
             ("imap", "auth_failed"): multiprocessing.Value("Q", 0),
             ("imap", "auth_trusted_network_denied"): multiprocessing.Value("Q", 0),
+            ("imap", "auth_ratelimited"): multiprocessing.Value("Q", 0),
             ("imap", "auth_error"): multiprocessing.Value("Q", 0),
             ("imap", "backend_error"): multiprocessing.Value("Q", 0),
             ("smtp", "auth_ok"): multiprocessing.Value("Q", 0),
             ("smtp", "auth_failed"): multiprocessing.Value("Q", 0),
             ("smtp", "auth_trusted_network_denied"): multiprocessing.Value("Q", 0),
+            ("smtp", "auth_ratelimited"): multiprocessing.Value("Q", 0),
             ("smtp", "auth_error"): multiprocessing.Value("Q", 0),
             ("smtp", "backend_error"): multiprocessing.Value("Q", 0),
+            ("all", "ratelimit_bans"): multiprocessing.Value("Q", 0),
         }
 
     def inc(self, protocol: str, name: str, delta: int = 1) -> None:
@@ -65,6 +68,7 @@ class MetricsRegistry:
                 ("ok", "auth_ok"),
                 ("failed", "auth_failed"),
                 ("trusted_network_denied", "auth_trusted_network_denied"),
+                ("ratelimited", "auth_ratelimited"),
                 ("error", "auth_error"),
             ):
                 lines.append(
@@ -72,6 +76,9 @@ class MetricsRegistry:
                 )
 
         lines.extend([
+            "# HELP mailproxy_ratelimit_bans_total Total IP bans triggered by the mailproxy rate limiter.",
+            "# TYPE mailproxy_ratelimit_bans_total counter",
+            f'mailproxy_ratelimit_bans_total {self.get("all", "ratelimit_bans")}',
             "# HELP mailproxy_backend_errors_total Backend connection or GSSAPI auth failures.",
             "# TYPE mailproxy_backend_errors_total counter",
             f'mailproxy_backend_errors_total{{protocol="imap"}} {self.get("imap", "backend_error")}',

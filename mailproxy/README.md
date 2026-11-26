@@ -126,7 +126,7 @@ sequenceDiagram
 
 - **Strict TLS enforcement:** Cleartext authentication is blocked; `STARTTLS` pipelining is rejected; backend SMTP requires `STARTTLS` (cleartext downgrade refused); TLS 1.2+ with dual ECDSA + RSA certificate support.
 - **Pre-authentication isolation:** Post-auth IMAP commands (`SELECT`, `FETCH`, `IDLE`, etc.) and SMTP relay commands (`MAIL FROM`, `RCPT TO`, `DATA`, `BDAT`) are rejected before authentication succeeds.
-- **Brute-force protection:** Client source IPs are forwarded via `X-Forwarded-For` on Keycloak ROPC requests so Keycloak / CrowdSec rate-limiting and ban policies apply uniformly across HTTP, IMAP, and SMTP.
+- **Brute-force protection & built-in multi-worker rate limiting:** Client source IPs are forwarded via `X-Forwarded-For` on Keycloak ROPC requests for Keycloak / CrowdSec, AND a built-in shared-memory per-IP rate limiter (`ratelimit.py`, ~5.5 MiB fixed anonymous `mmap`, 131,072 slots) enforces incremental bans across all forked workers (`--workers > 1`) and all four ports (`143`, `993`, `587`, `465`) with zero external dependencies (completely isolated from `s4u2api`'s Valkey and Kerberos ccaches). `TrustedNetworkError` and upstream Keycloak outages are excluded from ban counts, matching OpenResty.
 - **Active load balancing:** Background health probes mark backends `DOWN` after `fall` consecutive failures and `UP` after `rise` consecutive successes, without interrupting established connections.
 - **Multi-worker scalability:** `--workers N` forks workers sharing pre-bound `SO_REUSEPORT` sockets, with shared-memory Prometheus counters and coordinated `SIGHUP` / `SIGTERM` handling.
 
@@ -141,7 +141,7 @@ Sending `SIGHUP` (`systemctl reload mailproxy` or `./docker/msxproxy.sh reload m
 - `[oidc]` credentials, discovery metadata, and Keycloak JWKS
 - `[proxy]` settings & `trusted_networks`, `[s4u2api]` target
 - `[imap]` & `[smtp]` backend pools (for new connections, preserving existing backend health state) and capabilities
-- `[loadbalancer]` probe thresholds
+- `[loadbalancer]` probe thresholds and `[ratelimit]` settings (`enabled`, `base_bantime`, `findtime`, `maxretry`, `max_bantime`, `ignore_networks`)
 
 *(Changing listening hosts or ports requires a restart.)*
 
@@ -176,7 +176,8 @@ When `--metrics-port` is enabled, `GET /metrics` exposes Prometheus text format 
 |---|---|---|---|
 | `mailproxy_connections_total` | counter | `protocol` (`imap`, `smtp`) | Total client connections accepted |
 | `mailproxy_connections_active` | gauge | `protocol` | Currently active client connections |
-| `mailproxy_auth_total` | counter | `protocol`, `result` (`ok`, `failed`, `trusted_network_denied`, `error`) | Client authentication outcomes |
+| `mailproxy_auth_total` | counter | `protocol`, `result` (`ok`, `failed`, `trusted_network_denied`, `ratelimited`, `error`) | Client authentication outcomes |
+| `mailproxy_ratelimit_bans_total` | counter | — | Total IP bans triggered by the mailproxy rate limiter |
 | `mailproxy_backend_errors_total` | counter | `protocol` | Backend connection or GSSAPI auth failures |
 | `mailproxy_backend_up` | gauge | `pool` (`imap`, `smtp`), `backend` | Exchange backend health (`1` = UP, `0` = DOWN) |
 

@@ -225,11 +225,12 @@ def main() -> None:
     logger.info("SMTPS (implicit TLS) %s:%d", config.LISTEN_SMTPS_HOST, config.LISTEN_SMTPS_PORT)
 
     if args.workers > 1:
+        mp_ctx = multiprocessing.get_context("fork")
         processes = []
         for idx in range(args.workers):
             # Only worker 0 serves /metrics (counters are shared via multiprocessing.Value)
             w_metrics_port = args.metrics_port if idx == 0 else None
-            p = multiprocessing.Process(
+            p = mp_ctx.Process(
                 target=_worker,
                 args=(socks, ssl_ctx, args.metrics_host, w_metrics_port),
             )

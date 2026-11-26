@@ -97,6 +97,13 @@ LB_FALL = 3
 LB_RISE = 2
 LB_TIMEOUT = 3.0
 
+RATELIMIT_ENABLED = True
+RATELIMIT_BASE_BANTIME = 60         # seconds (1 minute)
+RATELIMIT_FINDTIME = 12 * 3600      # seconds (12 hours)
+RATELIMIT_MAXRETRY = 15
+RATELIMIT_MAX_BANTIME = 15 * 60     # seconds (15 minutes)
+RATELIMIT_IGNORE_NETWORKS: list = []
+
 
 def _parse_backends(entries: list) -> list[tuple[str, int, bool]]:
     result = []
@@ -123,6 +130,8 @@ def load_config(path: str | Path | None = None, *, required: bool = False) -> bo
     global LISTEN_SMTP_HOST, LISTEN_SMTP_PORT, LISTEN_SMTPS_HOST, LISTEN_SMTPS_PORT
     global EHLO, PROXY_HOSTNAME, AUTH_TIMEOUT
     global LB_CHECK_INTERVAL, LB_FALL, LB_RISE, LB_TIMEOUT
+    global RATELIMIT_ENABLED, RATELIMIT_BASE_BANTIME, RATELIMIT_FINDTIME
+    global RATELIMIT_MAXRETRY, RATELIMIT_MAX_BANTIME
 
     cfg_path = Path(path) if path is not None else Path(CONFIG_PATH)
     CONFIG_PATH = str(cfg_path)
@@ -200,6 +209,20 @@ def load_config(path: str | Path | None = None, *, required: bool = False) -> bo
         LB_RISE = int(lb["rise"])
     if "timeout" in lb:
         LB_TIMEOUT = float(lb["timeout"])
+
+    rl = data.get("ratelimit", {})
+    if "enabled" in rl:
+        RATELIMIT_ENABLED = bool(rl["enabled"])
+    if "base_bantime" in rl:
+        RATELIMIT_BASE_BANTIME = int(rl["base_bantime"])
+    if "findtime" in rl:
+        RATELIMIT_FINDTIME = int(rl["findtime"])
+    if "maxretry" in rl:
+        RATELIMIT_MAXRETRY = int(rl["maxretry"])
+    if "max_bantime" in rl:
+        RATELIMIT_MAX_BANTIME = int(rl["max_bantime"])
+    if "ignore_networks" in rl:
+        RATELIMIT_IGNORE_NETWORKS[:] = [ip_network(net) for net in rl["ignore_networks"]]
 
     return True
 

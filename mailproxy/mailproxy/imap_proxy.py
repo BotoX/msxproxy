@@ -5,7 +5,7 @@ import traceback
 import contextlib
 
 from . import config
-from .auth import OIDCError, TrustedNetworkError
+from .auth import BadRequestError, ForbiddenError, OIDCError, TrustedNetworkError, UnauthorizedError
 from .utils import AUTH_MECHS, sasl_auth_flow, imap_login, close_writer, has_buffered_data
 from .imap_parser import ImapParser, ImapCommand
 from .imap_backend import (
@@ -16,6 +16,7 @@ from .imap_backend import (
 from .relay import relay
 from .loadbalancer import LoadBalancer
 from .metrics import metrics
+from .ratelimit import ratelimit
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class ImapProxyServer:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         addr = writer.get_extra_info("peername")
+        client_ip = addr[0] if addr else ""
         is_tls = writer.get_extra_info("ssl_object") is not None
 
         parser = ImapParser(reader, writer)
@@ -39,6 +41,14 @@ class ImapProxyServer:
         be_reader = None
         be_writer = None
         try:
+            banned, _retry_after = ratelimit.check(client_ip)
+            if banned:
+                metrics.inc("imap", "auth_ratelimited")
+                logger.info("IMAP connection rejected (rate-limited) from '%s'", client_ip)
+                writer.write(b"* BYE [UNAVAILABLE] Too many failed authentication attempts; try again later\r\n")
+                await writer.drain()
+                return
+
             async with asyncio.timeout(config.AUTH_TIMEOUT):
                 # Initial greeting
                 greeting = f"* OK {config.PROXY_HOSTNAME} IMAP4 service ready\r\n"
@@ -122,8 +132,20 @@ class ImapProxyServer:
                             await writer.drain()
                             continue
 
+                        banned, _retry_after = ratelimit.check(client_ip)
+                        if banned:
+                            metrics.inc("imap", "auth_ratelimited")
+                            writer.write(b"* BYE [UNAVAILABLE] Too many failed authentication attempts; try again later\r\n")
+                            await writer.drain()
+                            return
+
                         be_reader, be_writer = await self._handle_auth(cmd, reader, writer, addr)
                         if not be_writer:
+                            banned, _retry_after = ratelimit.check(client_ip)
+                            if banned:
+                                writer.write(b"* BYE [UNAVAILABLE] Too many failed authentication attempts; try again later\r\n")
+                                await writer.drain()
+                                return
                             tries += 1
                             await asyncio.sleep(tries)
 
@@ -214,10 +236,17 @@ class ImapProxyServer:
             writer.write(f"{tag} NO [AUTHORIZATIONFAILED] External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n".encode())
             await writer.drain()
             return None, None
-        except (OIDCError, ValueError, UnicodeDecodeError) as e:
+        except (UnauthorizedError, ForbiddenError, BadRequestError, ValueError, UnicodeDecodeError) as e:
             metrics.inc("imap", "auth_failed")
             logger.info("IMAP %s authentication failed from '%s': %r", mech, addr[0], str(e))
+            ratelimit.on_failure(addr[0])
             writer.write(f"{tag} NO [AUTHENTICATIONFAILED] Authentication credentials invalid\r\n".encode())
+            await writer.drain()
+            return None, None
+        except OIDCError as e:
+            metrics.inc("imap", "auth_error")
+            logger.warning("IMAP %s OIDC provider error from '%s': %r", mech, addr[0], str(e))
+            writer.write(f"{tag} NO [UNAVAILABLE] Authentication service temporarily unavailable\r\n".encode())
             await writer.drain()
             return None, None
         except Exception as e:
@@ -228,6 +257,7 @@ class ImapProxyServer:
             await writer.drain()
             return None, None
 
+        ratelimit.on_success(addr[0])
         metrics.inc("imap", "auth_ok")
         logger.info("IMAP (%s) authenticated %r (u=%r) (authzid=%r)", mech, upn, username, authzid)
 

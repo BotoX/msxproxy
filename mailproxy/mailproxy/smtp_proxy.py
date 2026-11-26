@@ -5,12 +5,13 @@ import traceback
 import contextlib
 
 from . import config
-from .auth import OIDCError, TrustedNetworkError
+from .auth import BadRequestError, ForbiddenError, OIDCError, TrustedNetworkError, UnauthorizedError
 from .utils import AUTH_MECHS, sasl_auth_flow, close_writer, has_buffered_data
 from .smtp_backend import smtp_ensure_tls_and_ehlo, smtp_gssapi_auth, smtp_login_auth
 from .relay import relay
 from .loadbalancer import LoadBalancer
 from .metrics import metrics
+from .ratelimit import ratelimit
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class SmtpProxyServer:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         addr = writer.get_extra_info("peername")
+        client_ip = addr[0] if addr else ""
         is_tls = writer.get_extra_info("ssl_object") is not None
 
         logger.debug(f"SMTP client connected: {addr}, TLS={is_tls}")
@@ -32,6 +34,14 @@ class SmtpProxyServer:
         be_reader = None
         be_writer = None
         try:
+            banned, _retry_after = ratelimit.check(client_ip)
+            if banned:
+                metrics.inc("smtp", "auth_ratelimited")
+                logger.info("SMTP connection rejected (rate-limited) from '%s'", client_ip)
+                writer.write(b"421 4.7.0 Too many failed authentication attempts; try again later\r\n")
+                await writer.drain()
+                return
+
             async with asyncio.timeout(config.AUTH_TIMEOUT):
                 # Initial greeting
                 greeting = f"220 {config.PROXY_HOSTNAME} ESMTP ready\r\n"
@@ -110,8 +120,20 @@ class SmtpProxyServer:
                             await writer.drain()
                             continue
 
+                        banned, _retry_after = ratelimit.check(client_ip)
+                        if banned:
+                            metrics.inc("smtp", "auth_ratelimited")
+                            writer.write(b"421 4.7.0 Too many failed authentication attempts; try again later\r\n")
+                            await writer.drain()
+                            return
+
                         be_reader, be_writer = await self._handle_auth(parts, reader, writer, addr)
                         if not be_writer:
+                            banned, _retry_after = ratelimit.check(client_ip)
+                            if banned:
+                                writer.write(b"421 4.7.0 Too many failed authentication attempts; try again later\r\n")
+                                await writer.drain()
+                                return
                             tries += 1
                             await asyncio.sleep(tries)
 
@@ -196,10 +218,17 @@ class SmtpProxyServer:
             writer.write(b"535 5.7.8 External access requires using a Mail Password. Generate one at https://login.uni-graz.at\r\n")
             await writer.drain()
             return None, None
-        except (OIDCError, ValueError, UnicodeDecodeError) as e:
+        except (UnauthorizedError, ForbiddenError, BadRequestError, ValueError, UnicodeDecodeError) as e:
             metrics.inc("smtp", "auth_failed")
             logger.info("SMTP %s authentication failed from '%s': %r", mech, addr[0], str(e))
+            ratelimit.on_failure(addr[0])
             writer.write(b"535 5.7.8 Authentication credentials invalid\r\n")
+            await writer.drain()
+            return None, None
+        except OIDCError as e:
+            metrics.inc("smtp", "auth_error")
+            logger.warning("SMTP %s OIDC provider error from '%s': %r", mech, addr[0], str(e))
+            writer.write(b"454 4.7.0 Authentication service temporarily unavailable\r\n")
             await writer.drain()
             return None, None
         except Exception as e:
@@ -210,6 +239,7 @@ class SmtpProxyServer:
             await writer.drain()
             return None, None
 
+        ratelimit.on_success(addr[0])
         metrics.inc("smtp", "auth_ok")
         logger.info("SMTP (%s) authenticated %r (u=%r) (authzid=%r)", mech, upn, username, authzid)
 

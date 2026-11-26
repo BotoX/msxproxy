@@ -501,3 +501,240 @@ def test_dual_ecdsa_and_rsa_cert_loading(tmp_path):
         _load_certs(ctx)
     finally:
         mp_config.PROXY_CERTS[:] = orig_certs
+
+
+# ── Shared-memory multi-worker rate limiter tests ────────────────────────────
+
+def test_ratelimit_toml_config_and_hot_reload(tmp_path):
+    from ipaddress import ip_network
+
+    orig = (
+        mp_config.CONFIG_PATH,
+        mp_config.RATELIMIT_ENABLED,
+        mp_config.RATELIMIT_BASE_BANTIME,
+        mp_config.RATELIMIT_FINDTIME,
+        mp_config.RATELIMIT_MAXRETRY,
+        mp_config.RATELIMIT_MAX_BANTIME,
+        list(mp_config.RATELIMIT_IGNORE_NETWORKS),
+    )
+    cfg = tmp_path / "mailproxy_rl.toml"
+    try:
+        cfg.write_text(
+            """\
+[ratelimit]
+enabled = true
+base_bantime = 120
+findtime = 3600
+maxretry = 5
+max_bantime = 600
+ignore_networks = ["127.0.0.1/32", "2001:db8::/32"]
+""",
+            encoding="utf-8",
+        )
+        assert mp_config.load_config(cfg, required=True) is True
+        assert mp_config.RATELIMIT_ENABLED is True
+        assert mp_config.RATELIMIT_BASE_BANTIME == 120
+        assert mp_config.RATELIMIT_FINDTIME == 3600
+        assert mp_config.RATELIMIT_MAXRETRY == 5
+        assert mp_config.RATELIMIT_MAX_BANTIME == 600
+        assert mp_config.RATELIMIT_IGNORE_NETWORKS == [
+            ip_network("127.0.0.1/32"),
+            ip_network("2001:db8::/32"),
+        ]
+
+        # Hot reload disabling rate limiting and clearing ignore_networks
+        cfg.write_text(
+            """\
+[ratelimit]
+enabled = false
+maxretry = 20
+ignore_networks = []
+""",
+            encoding="utf-8",
+        )
+        assert mp_config.load_config(cfg, required=True) is True
+        assert mp_config.RATELIMIT_ENABLED is False
+        assert mp_config.RATELIMIT_MAXRETRY == 20
+        assert mp_config.RATELIMIT_IGNORE_NETWORKS == []
+    finally:
+        (
+            mp_config.CONFIG_PATH,
+            mp_config.RATELIMIT_ENABLED,
+            mp_config.RATELIMIT_BASE_BANTIME,
+            mp_config.RATELIMIT_FINDTIME,
+            mp_config.RATELIMIT_MAXRETRY,
+            mp_config.RATELIMIT_MAX_BANTIME,
+            orig_ignore,
+        ) = orig
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = orig_ignore
+
+
+def test_shared_ratelimiter_bans_multipliers_reset_and_eviction():
+    from ipaddress import ip_network
+    from mailproxy.ratelimit import SharedRateLimiter
+
+    now = [1_700_000_000.0]
+    rl = SharedRateLimiter(num_sets=16, ways=4, time_fn=lambda: now[0])
+    assert rl.capacity == 64
+
+    orig = (
+        mp_config.RATELIMIT_ENABLED,
+        mp_config.RATELIMIT_BASE_BANTIME,
+        mp_config.RATELIMIT_FINDTIME,
+        mp_config.RATELIMIT_MAXRETRY,
+        mp_config.RATELIMIT_MAX_BANTIME,
+        list(mp_config.RATELIMIT_IGNORE_NETWORKS),
+    )
+    try:
+        mp_config.RATELIMIT_ENABLED = True
+        mp_config.RATELIMIT_BASE_BANTIME = 60
+        mp_config.RATELIMIT_FINDTIME = 3600
+        mp_config.RATELIMIT_MAXRETRY = 3
+        mp_config.RATELIMIT_MAX_BANTIME = 150
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = []
+
+        ip = "198.51.100.10"
+        assert rl.check(ip) == (False, 0)
+        assert rl.on_failure(ip) == (False, 0)
+        assert rl.on_failure(ip) == (False, 0)
+        # 3rd failure triggers ban #1 (1x = 60s)
+        assert rl.on_failure(ip) == (True, 60)
+        assert rl.check(ip) == (True, 60)
+        # IPv4-mapped IPv6 normalizes to the same key
+        assert rl.check("::ffff:198.51.100.10") == (True, 60)
+
+        # Advance 25s -> 35s remaining
+        now[0] += 25
+        assert rl.check(ip) == (True, 35)
+
+        # Expire ban #1
+        now[0] += 36
+        assert rl.check(ip) == (False, 0)
+
+        # Successful login clears fails but preserves ban count (bans == 1)
+        assert rl.on_failure(ip) == (False, 0)
+        rl.on_success(ip)
+        assert rl.on_failure(ip) == (False, 0)
+        assert rl.on_failure(ip) == (False, 0)
+        # 3rd failure after on_success triggers ban #2 (2x = 120s)
+        assert rl.on_failure(ip) == (True, 120)
+
+        # Expire ban #2 and trigger ban #3 -> capped at max_bantime = 150s (not 180s)
+        now[0] += 121
+        assert rl.on_failure(ip) == (False, 0)
+        assert rl.on_failure(ip) == (False, 0)
+        assert rl.on_failure(ip) == (True, 150)
+
+        # Expire entire findtime window -> starts fresh at ban #1 (60s)
+        now[0] += 3601
+        assert rl.check(ip) == (False, 0)
+        for _ in range(2):
+            assert rl.on_failure(ip) == (False, 0)
+        assert rl.on_failure(ip) == (True, 60)
+
+        # ignore_networks exempts matching IPv4 & IPv6 CIDRs
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = [
+            ip_network("203.0.113.0/24"),
+            ip_network("2001:db8:cafe::/48"),
+        ]
+        for _ in range(10):
+            assert rl.on_failure("203.0.113.5") == (False, 0)
+            assert rl.on_failure("2001:db8:cafe::1") == (False, 0)
+        assert rl.check("203.0.113.5") == (False, 0)
+        assert rl.check("2001:db8:cafe::1") == (False, 0)
+
+        # Disabled toggle bypasses checks and recording
+        mp_config.RATELIMIT_ENABLED = False
+        assert rl.check(ip) == (False, 0)
+        assert rl.on_failure("198.51.100.99") == (False, 0)
+
+        # Set-full eviction prefers evicting unbanned entries over actively banned ones
+        mp_config.RATELIMIT_ENABLED = True
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = []
+        tiny = SharedRateLimiter(num_sets=1, ways=2, time_fn=lambda: now[0])
+        # Ban ip_a (slot 0)
+        for _ in range(2):
+            tiny.on_failure("198.51.100.1")
+        assert tiny.on_failure("198.51.100.1") == (True, 60)
+        # Single failure for ip_b (slot 1, unbanned)
+        now[0] += 1
+        assert tiny.on_failure("198.51.100.2") == (False, 0)
+        # Failure for ip_c must evict unbanned ip_b, keeping banned ip_a intact!
+        now[0] += 1
+        assert tiny.on_failure("198.51.100.3") == (False, 0)
+        banned, remaining = tiny.check("198.51.100.1")
+        assert banned is True and remaining > 0
+    finally:
+        (
+            mp_config.RATELIMIT_ENABLED,
+            mp_config.RATELIMIT_BASE_BANTIME,
+            mp_config.RATELIMIT_FINDTIME,
+            mp_config.RATELIMIT_MAXRETRY,
+            mp_config.RATELIMIT_MAX_BANTIME,
+            orig_ignore,
+        ) = orig
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = orig_ignore
+
+
+def test_shared_ratelimiter_across_forked_workers():
+    """Verify failures recorded across separate forked workers share one ban table."""
+    import multiprocessing
+    from mailproxy.ratelimit import SharedRateLimiter
+
+    rl = SharedRateLimiter(num_sets=64, ways=4)
+    orig = (
+        mp_config.RATELIMIT_ENABLED,
+        mp_config.RATELIMIT_BASE_BANTIME,
+        mp_config.RATELIMIT_FINDTIME,
+        mp_config.RATELIMIT_MAXRETRY,
+        mp_config.RATELIMIT_MAX_BANTIME,
+        list(mp_config.RATELIMIT_IGNORE_NETWORKS),
+    )
+    try:
+        mp_config.RATELIMIT_ENABLED = True
+        mp_config.RATELIMIT_BASE_BANTIME = 120
+        mp_config.RATELIMIT_FINDTIME = 3600
+        mp_config.RATELIMIT_MAXRETRY = 4
+        mp_config.RATELIMIT_MAX_BANTIME = 300
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = []
+
+        attacker_ip = "198.51.100.77"
+        mp_ctx = multiprocessing.get_context("fork")
+
+        def worker_record(count: int):
+            for _ in range(count):
+                rl.on_failure(attacker_ip)
+
+        p1 = mp_ctx.Process(target=worker_record, args=(2,))
+        p2 = mp_ctx.Process(target=worker_record, args=(2,))
+        p1.start()
+        p2.start()
+        p1.join(timeout=5)
+        p2.join(timeout=5)
+        assert p1.exitcode == 0 and p2.exitcode == 0
+
+        # Combined 2 + 2 = 4 failures across workers must ban the IP in parent and new workers
+        banned, remaining = rl.check(attacker_ip)
+        assert banned is True and remaining > 0
+
+        q = mp_ctx.Queue()
+
+        def worker_check():
+            q.put(rl.check(attacker_ip))
+
+        p3 = mp_ctx.Process(target=worker_check)
+        p3.start()
+        p3.join(timeout=5)
+        assert p3.exitcode == 0
+        w_banned, w_rem = q.get(timeout=2)
+        assert w_banned is True and w_rem > 0
+    finally:
+        (
+            mp_config.RATELIMIT_ENABLED,
+            mp_config.RATELIMIT_BASE_BANTIME,
+            mp_config.RATELIMIT_FINDTIME,
+            mp_config.RATELIMIT_MAXRETRY,
+            mp_config.RATELIMIT_MAX_BANTIME,
+            orig_ignore,
+        ) = orig
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = orig_ignore

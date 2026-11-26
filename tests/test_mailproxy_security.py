@@ -446,3 +446,108 @@ def test_relay_binary_integrity_and_graceful_drain():
             await be_srv.wait_closed()
 
     asyncio.run(run())
+
+
+# ── 7. Built-in rate limiter enforcement & exclusions on IMAP & SMTP ─────────
+
+def test_imap_and_smtp_ratelimit_enforcement_and_exclusions():
+    """
+    Verify:
+    - Repeated invalid credentials trigger ban on IMAP, immediately closing the
+      connection with `* BYE`, and reject subsequent SMTP connections from the
+      same IP on connect with `421 4.7.0`.
+    - TrustedNetworkError and base OIDCError (Keycloak outage) do NOT count
+      toward rate-limit bans.
+    """
+    from mailproxy.auth import OIDCError, TrustedNetworkError, UnauthorizedError
+    from mailproxy.ratelimit import ratelimit
+
+    orig = (
+        mp_config.RATELIMIT_ENABLED,
+        mp_config.RATELIMIT_BASE_BANTIME,
+        mp_config.RATELIMIT_FINDTIME,
+        mp_config.RATELIMIT_MAXRETRY,
+        mp_config.RATELIMIT_MAX_BANTIME,
+        list(mp_config.RATELIMIT_IGNORE_NETWORKS),
+    )
+
+    async def run():
+        ratelimit.reset()
+        mp_config.RATELIMIT_ENABLED = True
+        mp_config.RATELIMIT_BASE_BANTIME = 120
+        mp_config.RATELIMIT_FINDTIME = 3600
+        mp_config.RATELIMIT_MAXRETRY = 2
+        mp_config.RATELIMIT_MAX_BANTIME = 300
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = []
+
+        imap_srv = ImapProxyServer(lb=MagicMock(), ssl_ctx=MagicMock())
+        smtp_srv = SmtpProxyServer(lb=MagicMock(), ssl_ctx=MagicMock())
+
+        # 1. TrustedNetworkError must NOT trigger a ban even after > maxretry attempts
+        with patch("mailproxy.imap_proxy.imap_login", new=AsyncMock(side_effect=TrustedNetworkError())), \
+             patch("mailproxy.imap_proxy.asyncio.sleep", new=AsyncMock()):
+            r = _reader(
+                b"A1 LOGIN alice regularpw\r\n"
+                b"A2 LOGIN alice regularpw\r\n"
+                b"A3 LOGIN alice regularpw\r\n"
+                b"A4 LOGOUT\r\n"
+            )
+            w = MockWriter(is_tls=True, peername=("198.51.100.50", 40001))
+            await imap_srv.handle_client(r, w)
+            assert b"AUTHORIZATIONFAILED" in w.buf
+            assert b"Too many failed authentication attempts" not in w.buf
+            assert ratelimit.check("198.51.100.50") == (False, 0)
+
+        # 2. Base OIDCError (Keycloak outage) must NOT trigger a ban
+        with patch("mailproxy.imap_proxy.imap_login", new=AsyncMock(side_effect=OIDCError("Keycloak down"))), \
+             patch("mailproxy.imap_proxy.asyncio.sleep", new=AsyncMock()):
+            r = _reader(
+                b"A1 LOGIN alice pw\r\n"
+                b"A2 LOGIN alice pw\r\n"
+                b"A3 LOGIN alice pw\r\n"
+                b"A4 LOGOUT\r\n"
+            )
+            w = MockWriter(is_tls=True, peername=("198.51.100.51", 40002))
+            await imap_srv.handle_client(r, w)
+            assert b"[UNAVAILABLE] Authentication service temporarily unavailable" in w.buf
+            assert ratelimit.check("198.51.100.51") == (False, 0)
+
+        # 3. Invalid credentials (UnauthorizedError) trigger ban on 2nd failure,
+        #    immediately closing IMAP with `* BYE` and rejecting SMTP on connect!
+        with patch("mailproxy.imap_proxy.imap_login", new=AsyncMock(side_effect=UnauthorizedError("bad pw"))), \
+             patch("mailproxy.imap_proxy.asyncio.sleep", new=AsyncMock()):
+            r = _reader(
+                b"A1 LOGIN alice bad1\r\n"
+                b"A2 LOGIN alice bad2\r\n"
+                b"A3 LOGIN alice bad3\r\n"
+            )
+            w = MockWriter(is_tls=True, peername=("198.51.100.60", 40003))
+            await imap_srv.handle_client(r, w)
+            assert b"A1 NO [AUTHENTICATIONFAILED]" in w.buf
+            assert b"A2 NO [AUTHENTICATIONFAILED]" in w.buf
+            assert b"* BYE [UNAVAILABLE] Too many failed authentication attempts" in w.buf
+            # Connection closed immediately after A2 -> A3 never processed
+            assert b"A3 " not in w.buf
+            banned, rem = ratelimit.check("198.51.100.60")
+            assert banned is True and rem > 0
+
+        # Subsequent SMTP connection from the SAME banned IP is rejected immediately on connect
+        r_smtp = _reader(b"EHLO attacker.example\r\n")
+        w_smtp = MockWriter(is_tls=True, peername=("198.51.100.60", 40004))
+        await smtp_srv.handle_client(r_smtp, w_smtp)
+        assert b"421 4.7.0 Too many failed authentication attempts" in w_smtp.buf
+        assert b"220 " not in w_smtp.buf
+
+    try:
+        asyncio.run(run())
+    finally:
+        ratelimit.reset()
+        (
+            mp_config.RATELIMIT_ENABLED,
+            mp_config.RATELIMIT_BASE_BANTIME,
+            mp_config.RATELIMIT_FINDTIME,
+            mp_config.RATELIMIT_MAXRETRY,
+            mp_config.RATELIMIT_MAX_BANTIME,
+            orig_ignore,
+        ) = orig
+        mp_config.RATELIMIT_IGNORE_NETWORKS[:] = orig_ignore

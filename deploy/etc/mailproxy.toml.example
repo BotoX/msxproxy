@@ -6,7 +6,7 @@
 #   Supported for: TLS cert/key files, [oidc] credentials & JWKS,
 #                  [proxy] settings & trusted_networks, [s4u2api],
 #                  [imap] & [smtp] backends (for new connections) and caps,
-#                  and [loadbalancer] thresholds.
+#                  [loadbalancer] thresholds, and [ratelimit] settings.
 #   Requires restart: listen hosts/ports.
 
 # ---------------------------------------------------------
@@ -121,3 +121,14 @@ check_interval = 10.0       # 'inter': Seconds between active health checks
 fall           = 3          # 'fall': Consecutive failures to mark DOWN
 rise           = 2          # 'rise': Consecutive successes to mark UP
 timeout        = 3.0        # Health check & backend connection timeout (seconds)
+
+# ---------------------------------------------------------
+# Per-IP authentication rate limiter (shared across all workers & ports)
+# ---------------------------------------------------------
+[ratelimit]
+enabled         = true
+base_bantime    = 60        # seconds (1 minute) — multiplied on repeat bans
+findtime        = 43200     # seconds (12 hours) failure & ban-history window
+maxretry        = 15        # failed auth attempts before triggering a ban
+max_bantime     = 900       # seconds (15 minutes) maximum ban duration
+ignore_networks = []        # optional CIDRs exempt from rate limiting (e.g. ["127.0.0.1/32"])
